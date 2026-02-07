@@ -11,7 +11,7 @@ from AABB import AABB
 from BVH import BVH
 from Color import color, float_to_rgb8
 from interval import Interval
-from materials import Material
+from materials import Material,Texture,create_checker_texture,create_solid_texture,create_lambertian,create_dielectric,create_metal,create_uv_checker_texture
 from Objects import Hittable_list, Sphere, hit_record
 from Rand import (
     random_double,
@@ -22,7 +22,7 @@ from Frames_to_video import Frames_to_video
 
 ti.init(arch=ti.gpu, default_fp=ti.f32)
 
-# Aliases
+
 vec3 = tm.vec3
 point3 = tm.vec3
 
@@ -53,7 +53,7 @@ def create_sphere(c1, c2, r, mat_id):
     v = c2 - c1
     rvec = vec3(r, r, r)
 
-    # Create AABB in Python
+    
     min1, max1 = c1 - rvec, c1 + rvec
     aabb_min = vec3(min(min1[0], max1[0]), min(min1[1], max1[1]), min(min1[2], max1[2]))
     aabb_max = vec3(max(min1[0], max1[0]), max(min1[1], max1[1]), max(min1[2], max1[2]))
@@ -71,7 +71,7 @@ def create_sphere(c1, c2, r, mat_id):
             max(aabb_max[2], min2[2], max2[2]),
         )
 
-    # Create AABB using Interval
+    
     from interval import Interval
 
     bbox = AABB(
@@ -211,9 +211,9 @@ class Camera:
         focus_distance : float
             Focus distance.
         """
-        # ----------------------------
-        # Image parameters
-        # ----------------------------
+        
+        
+        
         self.samples_per_pixel = 512
         self.pixel_sample_scale = 1 / self.samples_per_pixel
         self.image_width = image_width
@@ -223,17 +223,17 @@ class Camera:
         )
         self.max_bounce_per_ray = 50
 
-        # ----------------------------
-        # Scene
-        # ----------------------------
+        
+        
+        
         self.world = world
         self.bvh = bvh
         self.hit_rec = hit_record.field(shape=(self.image_width, self.image_height))
         self.temp_rec = hit_record.field(shape=())
 
-        # ----------------------------
-        # Camera properties
-        # ----------------------------
+        
+        
+        
         self.camera_center = ti.Vector.field(3, ti.f32, shape=())
         self.lookat_f = ti.Vector.field(3, ti.f32, shape=())
         self.vup_f = ti.Vector.field(3, ti.f32, shape=())
@@ -322,10 +322,11 @@ class Camera:
         hit_color = vec3(0, 0, 0)
         loop_config(serialize=True)
         for _ in range(self.max_bounce_per_ray):
-            # Use BVH for intersection testing
+            
             if self.bvh.hit(
                 ray, Interval(1e-3, tm.inf), self.hit_rec, self.temp_rec, i, j
             ):
+                
                 if materials[self.hit_rec[i, j].mat_id].scatter(
                     ray, self.hit_rec[i, j], self.atten, self.scattered, i, j
                 ):
@@ -334,7 +335,7 @@ class Camera:
                 else:
                     break
             else:
-                # Sky gradient background
+                
                 unit_dir = tm.normalize(ray.direction)
                 a = 0.5 * (unit_dir.y + 1.0)
                 sky = (1.0 - a) * tm.vec3(1.0) + a * tm.vec3(0.5, 0.7, 1.0)
@@ -426,20 +427,40 @@ class Camera:
             )
 
 
-# ----------------------------
-# Scene objects
-# ----------------------------
+
+
+
+
 print("Scene Setup Started")
+
+
+checker_floor = create_checker_texture(
+    vec3(0.2, 0.3, 0.1),  
+    vec3(0.9, 0.9, 0.9),  
+    2.0
+)
+
+
+
+checker_sphere_texture = create_uv_checker_texture(
+    vec3(1.0, 0.0, 0.0),    
+    vec3(0.0, 0.0, 1.0),    
+    5  
+)
+
+
 scene_spheres = [
-    (point3(0, -1000, 0), 1000.0, Material(0, vec3(0.08, 0.08, 0.08), 0.0, 1.0)),
-    (point3(-3.0, 0.6, 0.0), 0.6, Material(1, vec3(0.95, 0.2, 0.2), 0.05, 1.0)),
-    (point3(-1.7, 0.45, 0.2), 0.45, Material(0, vec3(0.2, 0.95, 0.9), 0.0, 1.0)),
-    (point3(-0.5, 0.35, -0.1), 0.35, Material(1, vec3(0.9, 0.9, 0.95), 0.01, 1.0)),
-    (point3(0.6, 0.4, 0.15), 0.4, Material(2, vec3(1.0, 1.0, 1.0), 0.0, 1.5)),
-    (point3(1.8, 0.55, -0.15), 0.55, Material(0, vec3(0.9, 0.6, 0.1), 0.0, 1.0)),
-    (point3(3.2, 0.8, 0.0), 0.8, Material(1, vec3(0.2, 0.35, 1.0), 0.02, 1.0)),
-    (point3(0.0, 1.4, -1.2), 1.1, Material(2, vec3(1.0, 1.0, 1.0), 0.0, 1.5)),
-    (point3(0.0, 0.3, 2.2), 0.3, Material(0, vec3(0.95, 0.1, 0.7), 0.0, 1.0)),
+    
+    (point3(0, -100.5, -1), 100.0, create_lambertian(checker_floor)),
+
+    
+    (point3(-1, 0, -1), 0.5, create_lambertian(checker_sphere_texture)),
+
+    
+    (point3(0, 0, -1), 0.5, create_dielectric(1.5)),
+
+    
+    (point3(1, 0, -1), 0.5, create_metal(vec3(0.8, 0.6, 0.2), 0.0)),
 ]
 
 materials = Material.field(shape=len(scene_spheres))
@@ -451,28 +472,26 @@ for idx, (center, radius, mat) in enumerate(scene_spheres):
 
 print("Scene Initialised")
 
-# ----------------------------
-# Build BVH
-# ----------------------------
+
+
+
 print("Building BVH...")
 bvh = BVH(world.get_spheres_field(), world.get_sphere_count())
 print(f"BVH built with {bvh.node_count} nodes, {bvh.prim_count} primitives")
 
-# ----------------------------
-# Camera + render
-# ----------------------------
+
+
+
 output_dir = "output"
-if os.path.exists(output_dir):
-    shutil.rmtree(output_dir)
-os.makedirs(output_dir)
-num_frames = 180
-lookat = point3(0, 0.5, 0)
+if not os.path.exists(output_dir):
+    os.makedirs(output_dir)
+
+lookfrom = point3(0, 1, 2)
+lookat = point3(0, 0, -1)
 vup = vec3(0, 1, 0)
-base_radius = 1.0
-vfov = 30
-defocus_angle = 0.2
-focus_distance = -1
-lookfrom = point3(base_radius, 1.2, 0)
+vfov = 50
+defocus_angle = 0.0
+
 print("Taichi Started")
 c = pf()
 camera = Camera(
@@ -485,39 +504,19 @@ camera = Camera(
     lookat=lookat,
     vup=vup,
     defocus_angle=defocus_angle,
-    focus_distance=focus_distance,
+    focus_distance=(lookat - lookfrom).norm(),
 )
-spiral_radius = 15
 ti.sync()
 d = pf()
-print("Initialisation Complete")
-base_y = 0.8
-max_y = 8
-for frame in range(num_frames):
-    t = frame / num_frames
-    angle = 2 * math.pi * t
-    radius = base_radius + t * spiral_radius
-    lookfrom = point3(
-        radius * math.sin(angle),
-        (max_y - base_y)*t + base_y,
-        radius * math.cos(angle),
-    )
-    camera.camera_center[None] = lookfrom
-    camera.lookat_f[None] = lookat
-    camera.vup_f[None] = vup
-    camera.vfov[None] = vfov
-    camera.defocus_angle[None] = defocus_angle
-    camera.focal_distance[None] = (point3(-0.5, 0.35, -0.1) - lookfrom).norm()
-    camera.reinit()
-    a = pf()
-    camera.render()
-    ti.sync()
-    b = pf()
-    frame_name = f"frame_{str(frame).zfill(5)}.png"
-    output_path = os.path.join(output_dir, frame_name)
-    ti.tools.imwrite(camera.img.to_numpy(), output_path)
-    print(f"Image Saved to {output_path} and render took {b - a}s")
-
 print(f"Initialisation took {d - c}s")
-Frames_to_video(output_dir)
 
+print("Rendering...")
+a = pf()
+camera.render()
+ti.sync()
+b = pf()
+
+output_path = os.path.join(output_dir, "checker_scene.png")
+ti.tools.imwrite(camera.img.to_numpy(), output_path)
+print(f"Image saved to {output_path}")
+print(f"Render took {b - a}s")

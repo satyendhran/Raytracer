@@ -19,6 +19,10 @@ class hit_record:
         Surface normal at the intersection point.
     t : ti.f32
         Ray parameter at the intersection.
+    u : ti.f32
+        Horizontal texture coordinate [0, 1].
+    v : ti.f32
+        Vertical texture coordinate [0, 1].
     front_face : ti.u8
         Flag indicating whether the hit was on the front face (1) or back face (0).
     mat_id : ti.i32
@@ -28,6 +32,8 @@ class hit_record:
     p: ti.math.vec3
     normal: ti.math.vec3
     t: ti.f32
+    u: ti.f32
+    v: ti.f32
     front_face: ti.u8
     mat_id: ti.i32
 
@@ -57,28 +63,34 @@ class hit_record:
 def set(set_rec: hit_record, other_rec: hit_record, i, j):
     """
     Copies hit record data from a temporary record into a target record field.
-
-    Parameters
-    ----------
-    set_rec : hit_record
-        Destination hit record field.
-    other_rec : hit_record
-        Source hit record (singleton field).
-    i : int
-        First index into the destination field.
-    j : int
-        Second index into the destination field.
-
-    Returns
-    -------
-    None
     """
     set_rec[i, j].t = other_rec[None].t
     set_rec[i, j].p = other_rec[None].p
     set_rec[i, j].normal = other_rec[None].normal
+    set_rec[i, j].u = other_rec[None].u
+    set_rec[i, j].v = other_rec[None].v
     set_rec[i, j].front_face = other_rec[None].front_face
     set_rec[i, j].mat_id = other_rec[None].mat_id
 
+
+@ti.func
+def get_sphere_uv(p: ti.math.vec3):
+    """
+    Calculate UV coordinates for a point on a unit sphere.
+    p is the outward normal (normalized vector from center to surface point)
+    """
+    
+    
+    theta = ti.acos(ti.math.clamp(p.y, -1.0, 1.0))
+
+    
+    phi = ti.atan2(p.z, p.x)
+
+    
+    u = (phi + ti.math.pi) / (2.0 * ti.math.pi)
+    v = theta / ti.math.pi
+
+    return u, v
 
 @ti.dataclass
 class Sphere:
@@ -106,47 +118,40 @@ class Sphere:
 
     @ti.func
     def hit(self, r: Ray, ray_t: Interval, rec) -> ti.u1:
-        """
-        Tests whether a ray intersects the sphere within a given interval.
-
-        Uses the quadratic formula to solve for ray-sphere intersection.
-
-        Parameters
-        ----------
-        r : Ray
-            Ray to test for intersection.
-        ray_t : Interval
-            Valid range of ray parameters.
-        rec : hit_record
-            Output hit record (singleton field).
-
-        Returns
-        -------
-        ti.u1
-            1 if the ray hits the sphere within the interval, otherwise 0.
-        """
+        ret = 1
         current_centre = self.center.at(r.tm)
         oc = current_centre - r.origin
         a = tm.dot(r.direction, r.direction)
         h = tm.dot(r.direction, oc)
         c = tm.dot(oc, oc) - self.radius * self.radius
         D = h * h - a * c
+
+        
+        if D < 0.0:
+            ret = 0
+
         sqrtD = ti.math.sqrt(D)
 
-        hit = 0
+        
         root = (h - sqrtD) / a
         if not ray_t.surrounds(root):
             root = (h + sqrtD) / a
             if not ray_t.surrounds(root):
-                hit = 1
+                ret = 0  
 
-        rec[None].t = root
-        rec[None].p = r.at(rec[None].t)
-        outward_normal = (rec[None].p - current_centre) / self.radius
-        rec[None].set_face_normal(r, outward_normal)
-        rec[None].mat_id = self.mat_id
+        if ret:
+            
+            rec[None].t = root
+            rec[None].p = r.at(root)
+            outward_normal = (rec[None].p - current_centre) / self.radius
 
-        return ti.select(D < 0.0, 0, ti.select(ti.cast(hit, ti.i8), 0, 1))
+            
+            rec[None].u, rec[None].v = get_sphere_uv(outward_normal)
+            
+            rec[None].set_face_normal(r, outward_normal)
+            rec[None].mat_id = self.mat_id
+
+        return ret
 
 
 @ti.data_oriented
@@ -171,7 +176,7 @@ class Hittable_list:
         self.sphere_counter = ti.field(dtype=ti.i32, shape=())
         self.sphere_counter[None] = 0
         self.temp_rec = hit_record.field(shape=())
-        # Note: bbox is not used when BVH is enabled
+        
         self.bbox = None
 
     @ti.kernel
@@ -193,7 +198,7 @@ class Hittable_list:
         else:
             self.spheres[self.sphere_counter[None]] = sphere
             self.sphere_counter[None] += 1
-        # Note: bbox update removed - using BVH instead
+        
 
     def get_sphere_count(self):
         """

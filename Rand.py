@@ -2,9 +2,9 @@ import taichi as ti
 import taichi.math as tm
 
 
-# -----------------------------------------------------------------------------
-# Random helpers
-# -----------------------------------------------------------------------------
+
+
+
 @ti.func
 def random_double(a: ti.f32, b: ti.f32) -> ti.f32:
     """
@@ -45,9 +45,9 @@ def random_vec3(a: ti.f32, b: ti.f32) -> tm.vec3:
     )
 
 
-# -----------------------------------------------------------------------------
-# Direction sampling
-# -----------------------------------------------------------------------------
+
+
+
 @ti.func
 def random_unit_vec3() -> tm.vec3:
     """
@@ -96,9 +96,9 @@ def random_on_hemisphere(normal: tm.vec3) -> tm.vec3:
     )
 
 
-# -----------------------------------------------------------------------------
-# Reflection / refraction
-# -----------------------------------------------------------------------------
+
+
+
 @ti.func
 def reflect(v: tm.vec3, normal: tm.vec3) -> tm.vec3:
     """
@@ -145,15 +145,15 @@ def refract(
     cos_theta = ti.min(tm.dot(-uv, n), 1.0)
     r_out_perp = etai_over_etat * (uv + cos_theta * n)
 
-    # Numerical safety via abs to prevent sqrt of negative values
+    
     r_out_parallel = -ti.sqrt(ti.abs(1.0 - tm.dot(r_out_perp, r_out_perp))) * n
 
     return r_out_perp + r_out_parallel
 
 
-# -----------------------------------------------------------------------------
-# Disk sampling (DOF)
-# -----------------------------------------------------------------------------
+
+
+
 @ti.func
 def random_in_unit_disk() -> tm.vec3:
     """

@@ -6,9 +6,9 @@ from Ray import Ray
 vec3 = ti.math.vec3
 
 
-# =============================================================================
-# Taichi Data Structures for GPU Traversal
-# =============================================================================
+
+
+
 
 
 @ti.dataclass
@@ -72,9 +72,9 @@ def aabb_hit(
     return hit
 
 
-# =============================================================================
-# Python BVH Builder (runs at scene construction time)
-# =============================================================================
+
+
+
 
 
 class PythonBVHNode:
@@ -100,7 +100,7 @@ class BVHBuilder:
     a heap-indexed flat array for Taichi GPU traversal.
     """
 
-    MAX_LEAF_SIZE = 4  # Maximum primitives per leaf node
+    MAX_LEAF_SIZE = 4  
 
     def __init__(self, spheres_data):
         """
@@ -113,7 +113,7 @@ class BVHBuilder:
         """
         self.primitives = spheres_data
         self.ordered_prim_indices = []
-        self.nodes = []  # Flat list of nodes in heap order
+        self.nodes = []  
         self.root = None
 
     def build(self):
@@ -121,11 +121,11 @@ class BVHBuilder:
         if len(self.primitives) == 0:
             return
 
-        # Build the tree recursively
+        
         indices = list(range(len(self.primitives)))
         self.root = self._build_recursive(indices)
 
-        # Convert to heap-indexed array
+        
         self._convert_to_heap_array()
 
     def _compute_bounds(self, indices):
@@ -146,8 +146,8 @@ class BVHBuilder:
 
         for idx in indices:
             prim = self.primitives[idx]
-            aabb_min = prim[5]  # aabb_min
-            aabb_max = prim[6]  # aabb_max
+            aabb_min = prim[5]  
+            aabb_max = prim[6]  
 
             min_corner = vec3(
                 min(min_corner[0], aabb_min[0]),
@@ -196,7 +196,7 @@ class BVHBuilder:
 
         n = len(indices)
 
-        # Make a leaf if few enough primitives
+        
         if n <= self.MAX_LEAF_SIZE:
             node.is_leaf = True
             node.first_prim = len(self.ordered_prim_indices)
@@ -204,10 +204,10 @@ class BVHBuilder:
             for idx in indices:
                 self.ordered_prim_indices.append(
                     self.primitives[idx][4]
-                )  # sphere_index
+                )  
             return node
 
-        # Find the axis with the largest extent
+        
         extent = vec3(
             node.aabb_max[0] - node.aabb_min[0],
             node.aabb_max[1] - node.aabb_min[1],
@@ -221,17 +221,17 @@ class BVHBuilder:
         else:
             axis = 2
 
-        # Sort by centroid along the chosen axis
+        
         centroids = [(idx, self._compute_centroid(idx)[axis]) for idx in indices]
         centroids.sort(key=lambda x: x[1])
         sorted_indices = [c[0] for c in centroids]
 
-        # Split at the median
+        
         mid = n // 2
         left_indices = sorted_indices[:mid]
         right_indices = sorted_indices[mid:]
 
-        # Recursively build children
+        
         node.left = self._build_recursive(left_indices)
         node.right = self._build_recursive(right_indices)
         node.is_leaf = False
@@ -243,14 +243,14 @@ class BVHBuilder:
         if self.root is None:
             return
 
-        # Calculate maximum depth to determine array size
+        
         max_depth = self._get_depth(self.root)
-        max_nodes = (1 << (max_depth + 1)) - 1  # 2^(depth+1) - 1
+        max_nodes = (1 << (max_depth + 1)) - 1  
 
-        # Initialize nodes array with empty nodes
-        self.nodes = [None] * (max_nodes + 1)  # 1-indexed
+        
+        self.nodes = [None] * (max_nodes + 1)  
 
-        # BFS to assign heap indices
+        
         self._assign_heap_indices(self.root, 1)
 
     def _get_depth(self, node):
@@ -306,9 +306,9 @@ class BVHBuilder:
         return 0
 
 
-# =============================================================================
-# Taichi BVH Class for GPU Traversal
-# =============================================================================
+
+
+
 
 
 @ti.data_oriented
@@ -319,7 +319,7 @@ class BVH:
     Uses iterative stack-based traversal (no recursion on GPU).
     """
 
-    MAX_STACK_DEPTH = 64  # Maximum traversal stack depth
+    MAX_STACK_DEPTH = 64  
 
     def __init__(self, spheres_field, sphere_count):
         """
@@ -335,11 +335,11 @@ class BVH:
         self.spheres = spheres_field
         self.sphere_count = sphere_count
 
-        # Extract sphere data for Python builder
+        
         spheres_data = []
         for i in range(sphere_count):
             s = spheres_field[i]
-            center = s.center.origin  # Ray origin is the center
+            center = s.center.origin  
             radius = s.radius
             aabb_min = vec3(s.aabb.x.min, s.aabb.y.min, s.aabb.z.min)
             aabb_max = vec3(s.aabb.x.max, s.aabb.y.max, s.aabb.z.max)
@@ -347,25 +347,25 @@ class BVH:
                 (center[0], center[1], center[2], radius, i, aabb_min, aabb_max)
             )
 
-        # Build BVH in Python
+        
         builder = BVHBuilder(spheres_data)
         builder.build()
 
-        # Allocate Taichi fields
+        
         max_idx = max(builder.get_max_index(), 1)
         self.nodes = BVHNode.field(shape=(max_idx + 1,))
         self.node_count = max_idx
 
-        # Ordered primitive indices
+        
         n_prims = len(builder.ordered_prim_indices)
         self.prim_indices = ti.field(dtype=ti.i32, shape=(max(n_prims, 1),))
         self.prim_count = n_prims
 
-        # Copy data to Taichi fields
+        
         self._upload_to_gpu(builder)
 
-        # Temporary hit record for traversal
-        self.temp_rec = None  # Will be set by hit function
+        
+        self.temp_rec = None  
 
     def _upload_to_gpu(self, builder):
         """
@@ -374,7 +374,7 @@ class BVH:
         Args:
             builder: BVHBuilder instance containing the built tree.
         """
-        # Upload nodes
+        
         for i in range(1, len(builder.nodes)):
             node = builder.nodes[i]
             if node is not None:
@@ -386,7 +386,7 @@ class BVH:
                     prim_count=node.prim_count,
                 )
             else:
-                # Empty node (should not be traversed)
+                
                 self.nodes[i] = BVHNode(
                     aabb_min=vec3(0, 0, 0),
                     aabb_max=vec3(0, 0, 0),
@@ -395,7 +395,7 @@ class BVH:
                     prim_count=0,
                 )
 
-        # Upload primitive indices
+        
         for i, idx in enumerate(builder.ordered_prim_indices):
             self.prim_indices[i] = idx
 
@@ -429,24 +429,24 @@ class BVH:
         did_hit = 0
         closest_so_far = ray_t.max
 
-        # Use a simple iterative approach with explicit loop unrolling control
-        # Stack implemented as local variables with fixed max depth
-        # Using ti.Vector for local array storage
+        
+        
+        
         stack = ti.Vector([0] * 64, dt=ti.i32)
         stack_ptr = 0
 
-        # Start at root (index 1)
+        
         current = 1
 
-        # Limit iterations to prevent infinite loops
-        for _ in range(1000):  # Maximum iteration limit to prevent hangs
+        
+        for _ in range(1000):  
             if current > 0 and current <= self.node_count:
                 node = self.nodes[current]
 
-                # Check if ray hits this node's AABB
+                
                 if aabb_hit(node.aabb_min, node.aabb_max, r, ray_t.min, closest_so_far):
                     if node.is_leaf == 1:
-                        # Test all primitives in this leaf
+                        
                         for i in range(node.prim_count):
                             prim_idx = self.prim_indices[node.first_prim + i]
                             if self.spheres[prim_idx].hit(
@@ -456,15 +456,17 @@ class BVH:
                                 closest_so_far = temp_rec[None].t
                                 rec[x, y].t = temp_rec[None].t
                                 rec[x, y].p = temp_rec[None].p
+                                rec[x,y].u = temp_rec[None].u
+                                rec[x,y].v = temp_rec[None].v
                                 rec[x, y].normal = temp_rec[None].normal
                                 rec[x, y].front_face = temp_rec[None].front_face
                                 rec[x, y].mat_id = temp_rec[None].mat_id
                     else:
-                        # Internal node: push children to stack
+                        
                         left_child = 2 * current
                         right_child = 2 * current + 1
 
-                        # Push right first so left is processed first (LIFO)
+                        
                         if right_child <= self.node_count and stack_ptr < 63:
                             stack[stack_ptr] = right_child
                             stack_ptr += 1
@@ -473,7 +475,7 @@ class BVH:
                             current = left_child
                             continue
 
-            # Pop from stack
+            
             if stack_ptr > 0:
                 stack_ptr -= 1
                 current = stack[stack_ptr]
