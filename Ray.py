@@ -14,10 +14,10 @@ class Ray:
 
     origin: ti.math.vec3
     direction: ti.math.vec3
-    tm: ti.f64
+    tm: ti.f32
 
     @ti.func
-    def at(self, t: ti.f64) -> ti.math.vec3:
+    def at(self, t: ti.f32) -> ti.math.vec3:
         """
         Compute a point along the ray at parameter `t`.
 

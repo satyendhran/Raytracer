@@ -17,7 +17,7 @@ class hit_record:
         Point of intersection in world coordinates.
     normal : ti.math.vec3
         Surface normal at the intersection point.
-    t : ti.f64
+    t : ti.f32
         Ray parameter at the intersection.
     front_face : ti.u8
         Flag indicating whether the hit was on the front face (1) or back face (0).
@@ -27,7 +27,7 @@ class hit_record:
 
     p: ti.math.vec3
     normal: ti.math.vec3
-    t: ti.f64
+    t: ti.f32
     front_face: ti.u8
     mat_id: ti.i32
 
@@ -91,7 +91,7 @@ class Sphere:
     ----------
     center : Ray
         Center position of the sphere (Ray.origin is center, Ray.direction is velocity).
-    radius : ti.f64
+    radius : ti.f32
         Radius of the sphere.
     mat_id : ti.i32
         Material ID index for rendering.
@@ -100,7 +100,7 @@ class Sphere:
     """
 
     center: Ray
-    radius: ti.f64
+    radius: ti.f32
     mat_id: ti.i32
     aabb: AABB
 

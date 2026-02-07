@@ -38,8 +38,8 @@ class Material:
 
     material_type: ti.u8  # 0 for Lambertian, 1 for Metal, 2 for Dielectric
     albedo: ti.math.vec3
-    fuzz: ti.f64
-    refractive_index: ti.f64
+    fuzz: ti.f32
+    refractive_index: ti.f32
 
     @ti.func
     def scatter(self, r_in, rec, attenuation, scattered, i, j):

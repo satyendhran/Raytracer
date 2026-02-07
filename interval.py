@@ -8,14 +8,14 @@ class Interval:
 
     Attributes
     ----------
-    min : ti.f64
+    min : ti.f32
         Lower bound of the interval.
-    max : ti.f64
+    max : ti.f32
         Upper bound of the interval.
     """
 
-    min: ti.f64
-    max: ti.f64
+    min: ti.f32
+    max: ti.f32
 
     @ti.func
     def size(self):
@@ -24,19 +24,19 @@ class Interval:
 
         Returns
         -------
-        ti.f64
+        ti.f32
             Length of the interval, computed as (max - min).
         """
         return self.max - self.min
 
     @ti.func
-    def contains(self, x: ti.f64):
+    def contains(self, x: ti.f32):
         """
         Checks whether a value lies within the interval, inclusive.
 
         Parameters
         ----------
-        x : ti.f64
+        x : ti.f32
             Value to be tested.
 
         Returns
@@ -47,13 +47,13 @@ class Interval:
         return self.min <= x <= self.max
 
     @ti.func
-    def surrounds(self, x: ti.f64):
+    def surrounds(self, x: ti.f32):
         """
         Checks whether a value lies strictly inside the interval.
 
         Parameters
         ----------
-        x : ti.f64
+        x : ti.f32
             Value to be tested.
 
         Returns
@@ -64,30 +64,30 @@ class Interval:
         return self.min < x < self.max
 
     @ti.func
-    def clamp(self, x: ti.f64):
+    def clamp(self, x: ti.f32):
         """
         Clamps a value to lie within the interval.
 
         Parameters
         ----------
-        x : ti.f64
+        x : ti.f32
             Value to clamp.
 
         Returns
         -------
-        ti.f64
+        ti.f32
             Clamped value in [min, max].
         """
         return ti.math.clamp(x, self.min, self.max)
 
     @ti.func
-    def expand(self, delta: ti.f64):
+    def expand(self, delta: ti.f32):
         """
         Expands the interval by a given amount on both sides.
 
         Parameters
         ----------
-        delta : ti.f64
+        delta : ti.f32
             Total expansion amount (split equally on both sides).
 
         Returns

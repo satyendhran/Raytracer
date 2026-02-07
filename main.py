@@ -18,7 +18,7 @@ from Rand import (
 )
 from Ray import Ray
 
-ti.init(arch=ti.gpu, default_fp=ti.f64)
+ti.init(arch=ti.gpu, default_fp=ti.f32)
 
 # Aliases
 vec3 = tm.vec3
@@ -82,7 +82,7 @@ def create_sphere(c1, c2, r, mat_id):
 
 
 @ti.kernel
-def length(vec: vec3) -> ti.f64:
+def length(vec: vec3) -> ti.f32:
     """
     Compute the length of a vector.
 
@@ -93,7 +93,7 @@ def length(vec: vec3) -> ti.f64:
 
     Returns
     -------
-    ti.f64
+    ti.f32
         Length of the vector.
     """
     return ti.math.length(vec)
@@ -212,7 +212,7 @@ class Camera:
         # ----------------------------
         # Image parameters
         # ----------------------------
-        self.samples_per_pixel = 500
+        self.samples_per_pixel = 512
         self.pixel_sample_scale = 1 / self.samples_per_pixel
         self.image_width = image_width
         self.image_height = max(1, int(image_width / aspect_ratio))
@@ -262,7 +262,7 @@ class Camera:
             self.pixel_delta_u + self.pixel_delta_v
         )
         self.atten = self.atten = ti.Vector.field(
-            3, dtype=ti.f64, shape=(self.image_width, self.image_height)
+            3, dtype=ti.f32, shape=(self.image_width, self.image_height)
         )
 
         self.scattered = Ray.field(shape=(self.image_width, self.image_height))
@@ -497,7 +497,7 @@ c = pf()
 camera = Camera(
     world,
     bvh,
-    image_width=2560,
+    image_width=3840,
     aspect_ratio=16.0 / 9.0,
     vfov=20,
     lookfrom=lookfrom,

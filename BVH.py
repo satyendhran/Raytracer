@@ -41,7 +41,7 @@ class BVHNode:
 
 @ti.func
 def aabb_hit(
-    aabb_min: vec3, aabb_max: vec3, r: Ray, t_min: ti.f64, t_max: ti.f64
+    aabb_min: vec3, aabb_max: vec3, r: Ray, t_min: ti.f32, t_max: ti.f32
 ) -> ti.i32:
     """
     Test if a ray intersects an AABB within the given t range.

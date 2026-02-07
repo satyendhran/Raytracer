@@ -6,7 +6,7 @@ import taichi.math as tm
 # Random helpers
 # -----------------------------------------------------------------------------
 @ti.func
-def random_double(a: ti.f64, b: ti.f64) -> ti.f64:
+def random_double(a: ti.f32, b: ti.f32) -> ti.f32:
     """
     Generate a random float in [a, b).
 
@@ -24,7 +24,7 @@ def random_double(a: ti.f64, b: ti.f64) -> ti.f64:
 
 
 @ti.func
-def random_vec3(a: ti.f64, b: ti.f64) -> tm.vec3:
+def random_vec3(a: ti.f32, b: ti.f32) -> tm.vec3:
     """
     Generate a random 3D vector with each component in [a, b).
 
@@ -123,7 +123,7 @@ def reflect(v: tm.vec3, normal: tm.vec3) -> tm.vec3:
 def refract(
     uv: tm.vec3,
     n: tm.vec3,
-    etai_over_etat: ti.f64,
+    etai_over_etat: ti.f32,
 ) -> tm.vec3:
     """
     Refract a vector using Snell's law.
