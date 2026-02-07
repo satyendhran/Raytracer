@@ -1,7 +1,8 @@
 import math
+import os
 import random
 from time import perf_counter as pf
-
+import shutil
 import taichi as ti
 import taichi.math as tm
 from taichi import loop_config
@@ -17,6 +18,7 @@ from Rand import (
     random_in_unit_disk,
 )
 from Ray import Ray
+from Frames_to_video import Frames_to_video
 
 ti.init(arch=ti.gpu, default_fp=ti.f32)
 
@@ -232,44 +234,63 @@ class Camera:
         # ----------------------------
         # Camera properties
         # ----------------------------
-        self.vfov = vfov
-        theta = math.radians(self.vfov)
-        h = math.tan(theta / 2)
-        self.focal_distance = focus_distance
-        self.viewport_height = 2.0 * h * self.focal_distance
-        self.viewport_width = self.viewport_height * aspect_ratio
-
-        self.w = normalize(lookfrom - lookat)
-        self.u = normalize(cross(vup, self.w))
-        self.v = cross(self.w, self.u)
-
-        self.camera_center = lookfrom
-
-        self.viewport_u = self.viewport_width * self.u
-        self.viewport_v = -self.viewport_height * self.v
-
-        self.pixel_delta_u = self.viewport_u / self.image_width
-        self.pixel_delta_v = self.viewport_v / self.image_height
-
-        self.viewport_upper_left = (
-            self.camera_center
-            - self.focal_distance * self.w
-            - 0.5 * self.viewport_u
-            - 0.5 * self.viewport_v
-        )
-
-        self.pixel00_loc = self.viewport_upper_left + 0.5 * (
-            self.pixel_delta_u + self.pixel_delta_v
-        )
+        self.camera_center = ti.Vector.field(3, ti.f32, shape=())
+        self.lookat_f = ti.Vector.field(3, ti.f32, shape=())
+        self.vup_f = ti.Vector.field(3, ti.f32, shape=())
+        self.vfov = ti.field(ti.f32, shape=())
+        self.defocus_angle = ti.field(ti.f32, shape=())
+        self.focal_distance = ti.field(ti.f32, shape=())
+        self.pixel00_loc = ti.Vector.field(3, ti.f32, shape=())
+        self.pixel_delta_u = ti.Vector.field(3, ti.f32, shape=())
+        self.pixel_delta_v = ti.Vector.field(3, ti.f32, shape=())
+        self.defocus_disk_u = ti.Vector.field(3, ti.f32, shape=())
+        self.defocus_disk_v = ti.Vector.field(3, ti.f32, shape=())
         self.atten = self.atten = ti.Vector.field(
             3, dtype=ti.f32, shape=(self.image_width, self.image_height)
         )
 
         self.scattered = Ray.field(shape=(self.image_width, self.image_height))
-        self.defocus_angle = defocus_angle
-        defocus_radius = focus_distance * math.tan(math.radians(defocus_angle / 2))
-        self.defocus_disk_u = self.u * defocus_radius
-        self.defocus_disk_v = self.v * defocus_radius
+        self.camera_center[None] = lookfrom
+        self.lookat_f[None] = lookat
+        self.vup_f[None] = vup
+        self.vfov[None] = vfov
+        self.defocus_angle[None] = defocus_angle
+        self.focal_distance[None] = focus_distance
+        self.reinit()
+
+    def reinit(self):
+        w = normalize(self.camera_center[None] - self.lookat_f[None])
+        u = normalize(cross(self.vup_f[None], w))
+        v = cross(w, u)
+
+        theta = math.radians(self.vfov[None])
+        h = math.tan(theta * 0.5)
+
+        viewport_height = 2.0 * h * self.focal_distance[None]
+        viewport_width = viewport_height * (self.image_width / self.image_height)
+
+        viewport_u = viewport_width * u
+        viewport_v = -viewport_height * v
+
+        self.pixel_delta_u[None] = viewport_u / self.image_width
+        self.pixel_delta_v[None] = viewport_v / self.image_height
+
+        viewport_upper_left = (
+            self.camera_center[None]
+            - self.focal_distance[None] * w
+            - 0.5 * viewport_u
+            - 0.5 * viewport_v
+        )
+
+        self.pixel00_loc[None] = viewport_upper_left + 0.5 * (
+            self.pixel_delta_u[None] + self.pixel_delta_v[None]
+        )
+
+        defocus_radius = self.focal_distance[None] * math.tan(
+            math.radians(self.defocus_angle[None] * 0.5)
+        )
+        self.defocus_disk_u[None] = u * defocus_radius
+        self.defocus_disk_v[None] = v * defocus_radius
 
     @ti.func
     def ray_color(self, r: Ray, i: int, j: int) -> vec3:
@@ -347,7 +368,9 @@ class Camera:
         """
         p = random_in_unit_disk()
         return (
-            self.camera_center + p.x * self.defocus_disk_u + p.y * self.defocus_disk_v
+            self.camera_center[None]
+            + p.x * self.defocus_disk_u[None]
+            + p.y * self.defocus_disk_v[None]
         )
 
     @ti.func
@@ -371,12 +394,14 @@ class Camera:
         """
         offset = self.get_sq()
         pixel_sample = (
-            self.pixel00_loc
-            + ((i + offset.x) * self.pixel_delta_u)
-            + ((j + offset.y) * self.pixel_delta_v)
+            self.pixel00_loc[None]
+            + ((i + offset.x) * self.pixel_delta_u[None])
+            + ((j + offset.y) * self.pixel_delta_v[None])
         )
         ray_origin = ti.select(
-            self.defocus_angle <= 0, self.camera_center, self.defocus_disk_sample()
+            self.defocus_angle[None] <= 0,
+            self.camera_center[None],
+            self.defocus_disk_sample(),
         )
         ray_direction = pixel_sample - ray_origin
         ray_time = random_double(0, 1)
@@ -405,77 +430,24 @@ class Camera:
 # Scene objects
 # ----------------------------
 print("Scene Setup Started")
-materials = Material.field(shape=1 + 22 * 22 + 3)
+scene_spheres = [
+    (point3(0, -1000, 0), 1000.0, Material(0, vec3(0.08, 0.08, 0.08), 0.0, 1.0)),
+    (point3(-3.0, 0.6, 0.0), 0.6, Material(1, vec3(0.95, 0.2, 0.2), 0.05, 1.0)),
+    (point3(-1.7, 0.45, 0.2), 0.45, Material(0, vec3(0.2, 0.95, 0.9), 0.0, 1.0)),
+    (point3(-0.5, 0.35, -0.1), 0.35, Material(1, vec3(0.9, 0.9, 0.95), 0.01, 1.0)),
+    (point3(0.6, 0.4, 0.15), 0.4, Material(2, vec3(1.0, 1.0, 1.0), 0.0, 1.5)),
+    (point3(1.8, 0.55, -0.15), 0.55, Material(0, vec3(0.9, 0.6, 0.1), 0.0, 1.0)),
+    (point3(3.2, 0.8, 0.0), 0.8, Material(1, vec3(0.2, 0.35, 1.0), 0.02, 1.0)),
+    (point3(0.0, 1.4, -1.2), 1.1, Material(2, vec3(1.0, 1.0, 1.0), 0.0, 1.5)),
+    (point3(0.0, 0.3, 2.2), 0.3, Material(0, vec3(0.95, 0.1, 0.7), 0.0, 1.0)),
+]
 
-# Ground material (large Lambertian sphere)
-materials[0] = Material(0, vec3(0.5, 0.5, 0.5), 0.0, 1.0)
+materials = Material.field(shape=len(scene_spheres))
+world = Hittable_list(len(scene_spheres))
 
-world = Hittable_list(1 + 22 * 22 + 3)
-
-# Ground sphere
-world.add_sphere(create_sphere(point3(0, -1000, 0), point3(0, -1000, 0), 1000.0, 0))
-
-mat_id = 1
-
-# Generate random spheres in grid pattern
-for a in range(-11, 11):
-    for b in range(-11, 11):
-        choose_mat = random.uniform(0.0, 1.0)
-
-        center = point3(
-            a + 0.9 * random.uniform(0.0, 1.0),
-            0.2,
-            b + 0.9 * random.uniform(0.0, 1.0),
-        )
-
-        dx = center.x - 4.0
-        dy = center.y - 0.2
-        dz = center.z - 0.0
-
-        # Skip spheres too close to the large spheres
-        if math.sqrt(dx * dx + dy * dy + dz * dz) > 0.9:
-            if choose_mat < 0.8:
-                # Diffuse material
-                albedo = vec3(
-                    random.uniform(0.0, 1.0) * random.uniform(0.0, 1.0),
-                    random.uniform(0.0, 1.0) * random.uniform(0.0, 1.0),
-                    random.uniform(0.0, 1.0) * random.uniform(0.0, 1.0),
-                )
-                centre2 = center
-                materials[mat_id] = Material(0, albedo, 0.0, 1.0)
-
-            elif choose_mat < 0.95:
-                # Metal material
-                albedo = vec3(
-                    random.uniform(0.5, 1.0),
-                    random.uniform(0.5, 1.0),
-                    random.uniform(0.5, 1.0),
-                )
-                fuzz = random.uniform(0.0, 0.5)
-                centre2 = center
-                materials[mat_id] = Material(1, albedo, fuzz, 1.0)
-
-            else:
-                # Glass material
-                materials[mat_id] = Material(2, vec3(1, 1, 1), 0.0, 1.5)
-                centre2 = center
-
-            world.add_sphere(create_sphere(center, centre2, 0.2, mat_id))
-            mat_id += 1
-
-# Large glass sphere
-materials[mat_id] = Material(2, vec3(1, 1, 1), 0.0, 1.5)
-world.add_sphere(create_sphere(point3(0, 1, 0), point3(0, 1, 0), 1.0, mat_id))
-mat_id += 1
-
-# Large diffuse sphere
-materials[mat_id] = Material(0, vec3(0.4, 0.2, 0.1), 0.0, 1.0)
-world.add_sphere(create_sphere(point3(-4, 1, 0), point3(-4, 1, 0), 1.0, mat_id))
-mat_id += 1
-
-# Large metal sphere
-materials[mat_id] = Material(1, vec3(0.7, 0.6, 0.5), 0.0, 1.0)
-world.add_sphere(create_sphere(point3(4, 1, 0), point3(4, 1, 0), 1.0, mat_id))
+for idx, (center, radius, mat) in enumerate(scene_spheres):
+    materials[idx] = mat
+    world.add_sphere(create_sphere(center, center, radius, idx))
 
 print("Scene Initialised")
 
@@ -489,30 +461,63 @@ print(f"BVH built with {bvh.node_count} nodes, {bvh.prim_count} primitives")
 # ----------------------------
 # Camera + render
 # ----------------------------
-lookfrom = point3(13, 2, 3)
-lookat = point3(0, 0, 0)
+output_dir = "output"
+if os.path.exists(output_dir):
+    shutil.rmtree(output_dir)
+os.makedirs(output_dir)
+num_frames = 180
+lookat = point3(0, 0.5, 0)
 vup = vec3(0, 1, 0)
+base_radius = 1.0
+vfov = 30
+defocus_angle = 0.2
+focus_distance = -1
+lookfrom = point3(base_radius, 1.2, 0)
 print("Taichi Started")
 c = pf()
 camera = Camera(
     world,
     bvh,
-    image_width=3840,
+    image_width=1920,
     aspect_ratio=16.0 / 9.0,
-    vfov=20,
+    vfov=vfov,
     lookfrom=lookfrom,
     lookat=lookat,
     vup=vup,
-    defocus_angle=0.6,
-    focus_distance=10.0,
+    defocus_angle=defocus_angle,
+    focus_distance=focus_distance,
 )
+spiral_radius = 15
 ti.sync()
 d = pf()
 print("Initialisation Complete")
-a = pf()
-camera.render()
-ti.sync()
-b = pf()
-print("Taichi Completed")
-ti.tools.imwrite(camera.img.to_numpy(), "gradient2.png")
-print(f"Image Saved and render took {b - a}s and Initialisation took {d - c}s")
+base_y = 0.8
+max_y = 8
+for frame in range(num_frames):
+    t = frame / num_frames
+    angle = 2 * math.pi * t
+    radius = base_radius + t * spiral_radius
+    lookfrom = point3(
+        radius * math.sin(angle),
+        (max_y - base_y)*t + base_y,
+        radius * math.cos(angle),
+    )
+    camera.camera_center[None] = lookfrom
+    camera.lookat_f[None] = lookat
+    camera.vup_f[None] = vup
+    camera.vfov[None] = vfov
+    camera.defocus_angle[None] = defocus_angle
+    camera.focal_distance[None] = (point3(-0.5, 0.35, -0.1) - lookfrom).norm()
+    camera.reinit()
+    a = pf()
+    camera.render()
+    ti.sync()
+    b = pf()
+    frame_name = f"frame_{str(frame).zfill(5)}.png"
+    output_path = os.path.join(output_dir, frame_name)
+    ti.tools.imwrite(camera.img.to_numpy(), output_path)
+    print(f"Image Saved to {output_path} and render took {b - a}s")
+
+print(f"Initialisation took {d - c}s")
+Frames_to_video(output_dir)
+
