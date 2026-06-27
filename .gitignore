@@ -1,0 +1,8 @@
+output
+.venv
+.pytest_cache
+.vscode
+.idea
+tests
+gradient.png
+gradient2.png

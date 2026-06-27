@@ -31,11 +31,15 @@ class hit_record:
 
     p: ti.math.vec3
     normal: ti.math.vec3
+    geo_normal: ti.math.vec3
     t: ti.f32
     u: ti.f32
     v: ti.f32
+    bary_u: ti.f32
+    bary_v: ti.f32
     front_face: ti.u8
     mat_id: ti.i32
+    prim_id: ti.i32
 
     @ti.func
     def set_face_normal(self, r: Ray, outward_normal: ti.math.vec3):
@@ -67,10 +71,14 @@ def set(set_rec: hit_record, other_rec: hit_record, i, j):
     set_rec[i, j].t = other_rec[None].t
     set_rec[i, j].p = other_rec[None].p
     set_rec[i, j].normal = other_rec[None].normal
+    set_rec[i, j].geo_normal = other_rec[None].geo_normal
     set_rec[i, j].u = other_rec[None].u
     set_rec[i, j].v = other_rec[None].v
+    set_rec[i, j].bary_u = other_rec[None].bary_u
+    set_rec[i, j].bary_v = other_rec[None].bary_v
     set_rec[i, j].front_face = other_rec[None].front_face
     set_rec[i, j].mat_id = other_rec[None].mat_id
+    set_rec[i, j].prim_id = other_rec[None].prim_id
 
 
 @ti.func
@@ -118,7 +126,8 @@ class Sphere:
 
     @ti.func
     def hit(self, r: Ray, ray_t: Interval, rec) -> ti.u1:
-        ret = 1
+        """Sphere intersection with proper discriminant early-exit."""
+        ret = 0
         current_centre = self.center.at(r.tm)
         oc = current_centre - r.origin
         a = tm.dot(r.direction, r.direction)
@@ -126,30 +135,25 @@ class Sphere:
         c = tm.dot(oc, oc) - self.radius * self.radius
         D = h * h - a * c
 
-        
-        if D < 0.0:
-            ret = 0
+        if D >= 0.0:
+            # Clamp discriminant to 0 before sqrt to suppress negative-near-zero.
+            sqrtD = ti.math.sqrt(ti.max(D, 0.0))
 
-        sqrtD = ti.math.sqrt(D)
-
-        
-        root = (h - sqrtD) / a
-        if not ray_t.surrounds(root):
-            root = (h + sqrtD) / a
+            root = (h - sqrtD) / a
             if not ray_t.surrounds(root):
-                ret = 0  
+                root = (h + sqrtD) / a
+                if not ray_t.surrounds(root):
+                    D = -1.0  # Mark as miss
 
-        if ret:
-            
-            rec[None].t = root
-            rec[None].p = r.at(root)
-            outward_normal = (rec[None].p - current_centre) / self.radius
-
-            
-            rec[None].u, rec[None].v = get_sphere_uv(outward_normal)
-            
-            rec[None].set_face_normal(r, outward_normal)
-            rec[None].mat_id = self.mat_id
+            if D >= 0.0:
+                ret = 1
+                rec[None].t = root
+                rec[None].p = r.at(root)
+                outward_normal = (rec[None].p - current_centre) / self.radius
+                rec[None].u, rec[None].v = get_sphere_uv(outward_normal)
+                rec[None].set_face_normal(r, outward_normal)
+                rec[None].mat_id = self.mat_id
+                rec[None].prim_id = -1
 
         return ret
 

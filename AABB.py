@@ -67,21 +67,26 @@ class AABB:
         ray_dir = r.direction
         no_hit = False
 
-        for axis in range(3):
+        for axis in ti.static(range(3)):
             ax = self.axis_interval(axis)
-            adinv = 1 / ray_dir[axis]
-            t0 = (ax.min - ray_origin[axis]) * adinv
-            t1 = (ax.max - ray_origin[axis]) * adinv
+            d = ray_dir[axis]
+            if ti.abs(d) < 1e-12:
+                if (ray_origin[axis] < ax.min) | (ray_origin[axis] > ax.max):
+                    no_hit = True
+            else:
+                adinv = 1.0 / d
+                t0 = (ax.min - ray_origin[axis]) * adinv
+                t1 = (ax.max - ray_origin[axis]) * adinv
 
-            if t0 > t1:
-                t0, t1 = t1, t0
+                if t0 > t1:
+                    t0, t1 = t1, t0
 
-            if t0 > ray_t[None].min:
-                ray_t[None].min = t0
-            if t1 < ray_t[None].max:
-                ray_t[None].max = t1
-            if ray_t[None].min >= ray_t[None].max:
-                no_hit = True
+                if t0 > ray_t[None].min:
+                    ray_t[None].min = t0
+                if t1 < ray_t[None].max:
+                    ray_t[None].max = t1
+                if ray_t[None].min >= ray_t[None].max:
+                    no_hit = True
 
         return ti.select(no_hit, 0, 1)
 

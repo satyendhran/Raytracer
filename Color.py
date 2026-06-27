@@ -32,8 +32,8 @@ def float_to_rgb8(col: color) -> color:
     """
     Convert a normalized RGB color [0, 1] to 8-bit RGB [0, 255].
 
-    Applies gamma correction, clamps values to valid range, and converts
-    to 8-bit unsigned integer format.
+    The renderer's filmic tone mapper already applies display gamma, so this
+    function only clamps and quantizes to avoid double gamma correction.
 
     Args:
         col: RGB color vector with values in [0, 1].
@@ -42,4 +42,4 @@ def float_to_rgb8(col: color) -> color:
         RGB color vector with 8-bit values [0, 255] as unsigned integers.
     """
     intensity = Interval(0, 0.9999)
-    return ti.cast(intensity.clamp(transform_vec(col)) * 256, ti.u8)
+    return ti.cast(intensity.clamp(col) * 256, ti.u8)
