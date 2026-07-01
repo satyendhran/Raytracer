@@ -1,10 +1,17 @@
 import taichi as ti
+
 from src.core.interval import Interval
 from src.core.Ray import Ray
+
 vec3 = ti.math.vec3
 
+
 def _merge_aabb(mina, maxa, minb, maxb):
-    return (vec3(min(mina[0], minb[0]), min(mina[1], minb[1]), min(mina[2], minb[2])), vec3(max(maxa[0], maxb[0]), max(maxa[1], maxb[1]), max(maxa[2], maxb[2])))
+    return (
+        vec3(min(mina[0], minb[0]), min(mina[1], minb[1]), min(mina[2], minb[2])),
+        vec3(max(maxa[0], maxb[0]), max(maxa[1], maxb[1]), max(maxa[2], maxb[2])),
+    )
+
 
 def _aabb_surface_area(mn, mx):
     dx = max(0.0, float(mx[0] - mn[0]))
@@ -12,21 +19,26 @@ def _aabb_surface_area(mn, mx):
     dz = max(0.0, float(mx[2] - mn[2]))
     return max(2.0 * (dx * dy + dy * dz + dz * dx), 1e-20)
 
+
 @ti.dataclass
 class BVHNode:
     aabb_min: vec3
     aabb_max: vec3
-    is_leaf: ti.i32
-    first_prim: ti.i32
+    left_or_first: ti.i32
+    count: ti.i32
     prim_count: ti.i32
 
 @ti.func
-def aabb_hit(aabb_min: vec3, aabb_max: vec3, r: Ray, t_min: ti.f32, t_max: ti.f32) -> ti.i32:
+def aabb_hit(
+    aabb_min: vec3, aabb_max: vec3, r: Ray, t_min: ti.f32, t_max: ti.f32
+) -> ti.i32:
     miss = 0
     for axis in ti.static(range(3)):
         d = r.direction[axis]
         parallel = ti.abs(d) < 1e-12
-        outside = parallel & ((r.origin[axis] < aabb_min[axis]) | (r.origin[axis] > aabb_max[axis]))
+        outside = parallel & (
+            (r.origin[axis] < aabb_min[axis]) | (r.origin[axis] > aabb_max[axis])
+        )
         miss = ti.select(outside, 1, miss)
         safe_d = ti.select(parallel, ti.select(d < 0.0, -1e-12, 1e-12), d)
         inv_d = 1.0 / safe_d
@@ -38,15 +50,20 @@ def aabb_hit(aabb_min: vec3, aabb_max: vec3, r: Ray, t_min: ti.f32, t_max: ti.f3
         t_max = ti.min(tff, t_max)
     return ti.select((miss == 0) & (t_max >= ti.max(0.0, t_min)), 1, 0)
 
+
 @ti.func
-def aabb_ray_t_enter(aabb_min: vec3, aabb_max: vec3, r: Ray, t_min: ti.f32, t_max: ti.f32) -> ti.f32:
+def aabb_ray_t_enter(
+    aabb_min: vec3, aabb_max: vec3, r: Ray, t_min: ti.f32, t_max: ti.f32
+) -> ti.f32:
     t0 = t_min
     t1 = t_max
     miss = 0
     for axis in ti.static(range(3)):
         d = r.direction[axis]
         parallel = ti.abs(d) < 1e-12
-        outside = parallel & ((r.origin[axis] < aabb_min[axis]) | (r.origin[axis] > aabb_max[axis]))
+        outside = parallel & (
+            (r.origin[axis] < aabb_min[axis]) | (r.origin[axis] > aabb_max[axis])
+        )
         miss = ti.select(outside, 1, miss)
         safe_d = ti.select(parallel, ti.select(d < 0.0, -1e-12, 1e-12), d)
         inv_d = 1.0 / safe_d
@@ -54,10 +71,10 @@ def aabb_ray_t_enter(aabb_min: vec3, aabb_max: vec3, r: Ray, t_min: ti.f32, t_ma
         tf = (aabb_max[axis] - r.origin[axis]) * inv_d
         t0 = ti.max(ti.select(parallel, t0, ti.min(tn, tf)), t0)
         t1 = ti.min(ti.select(parallel, t1, ti.max(tn, tf)), t1)
-    return ti.select((miss != 0) | (t1 < t0), 1e+30, t0)
+    return ti.select((miss != 0) | (t1 < t0), 1e30, t0)
+
 
 class PythonBVHNode:
-
     def __init__(self):
         self.aabb_min = None
         self.aabb_max = None
@@ -67,10 +84,11 @@ class PythonBVHNode:
         self.first_prim = 0
         self.prim_count = 0
 
+
 class BVHBuilder:
     MAX_LEAF_SIZE = 4
 
-    def __init__(self, primitives_data, layout: str='sphere', split: str='sah'):
+    def __init__(self, primitives_data, layout: str = "sphere", split: str = "sah"):
         self.layout = layout
         self.split = split
         self.primitives = primitives_data
@@ -80,13 +98,13 @@ class BVHBuilder:
 
     def _aabb_of(self, idx):
         prim = self.primitives[idx]
-        if self.layout == 'sphere':
+        if self.layout == "sphere":
             return (prim[5], prim[6])
         return (prim[0], prim[1])
 
     def _prim_storage_index(self, idx):
         prim = self.primitives[idx]
-        if self.layout == 'sphere':
+        if self.layout == "sphere":
             return prim[4]
         return prim[2]
 
@@ -103,6 +121,7 @@ class BVHBuilder:
             v = (v | v << 4) & 51130563
             v = (v | v << 2) & 153391689
             return v
+
         xx = expand_bits(int(nx * 1023.0))
         yy = expand_bits(int(ny * 1023.0))
         zz = expand_bits(int(nz * 1023.0))
@@ -112,8 +131,14 @@ class BVHBuilder:
         if len(indices) <= 1:
             return indices
         scene_min, scene_max = self._compute_bounds(indices)
-        inv_extent = [1.0 / max(float(scene_max[0] - scene_min[0]), 1e-10), 1.0 / max(float(scene_max[1] - scene_min[1]), 1e-10), 1.0 / max(float(scene_max[2] - scene_min[2]), 1e-10)]
-        return sorted(indices, key=lambda i: self._morton_code(i, scene_min, inv_extent))
+        inv_extent = [
+            1.0 / max(float(scene_max[0] - scene_min[0]), 1e-10),
+            1.0 / max(float(scene_max[1] - scene_min[1]), 1e-10),
+            1.0 / max(float(scene_max[2] - scene_min[2]), 1e-10),
+        ]
+        return sorted(
+            indices, key=lambda i: self._morton_code(i, scene_min, inv_extent)
+        )
 
     def build(self):
         if len(self.primitives) == 0:
@@ -125,31 +150,43 @@ class BVHBuilder:
     def _compute_bounds(self, indices):
         if not indices:
             return (vec3(0, 0, 0), vec3(0, 0, 0))
-        min_corner = vec3(float('inf'), float('inf'), float('inf'))
-        max_corner = vec3(float('-inf'), float('-inf'), float('-inf'))
+        min_corner = vec3(float("inf"), float("inf"), float("inf"))
+        max_corner = vec3(float("-inf"), float("-inf"), float("-inf"))
         for idx in indices:
             aabb_min, aabb_max = self._aabb_of(idx)
-            min_corner = vec3(min(min_corner[0], aabb_min[0]), min(min_corner[1], aabb_min[1]), min(min_corner[2], aabb_min[2]))
-            max_corner = vec3(max(max_corner[0], aabb_max[0]), max(max_corner[1], aabb_max[1]), max(max_corner[2], aabb_max[2]))
+            min_corner = vec3(
+                min(min_corner[0], aabb_min[0]),
+                min(min_corner[1], aabb_min[1]),
+                min(min_corner[2], aabb_min[2]),
+            )
+            max_corner = vec3(
+                max(max_corner[0], aabb_max[0]),
+                max(max_corner[1], aabb_max[1]),
+                max(max_corner[2], aabb_max[2]),
+            )
         return (min_corner, max_corner)
 
     def _compute_centroid(self, idx):
         aabb_min, aabb_max = self._aabb_of(idx)
-        return vec3((aabb_min[0] + aabb_max[0]) * 0.5, (aabb_min[1] + aabb_max[1]) * 0.5, (aabb_min[2] + aabb_max[2]) * 0.5)
+        return vec3(
+            (aabb_min[0] + aabb_max[0]) * 0.5,
+            (aabb_min[1] + aabb_max[1]) * 0.5,
+            (aabb_min[2] + aabb_max[2]) * 0.5,
+        )
 
     def _sah_partition(self, indices):
         n = len(indices)
         if n <= 1:
             return (indices[:], indices[:])
-        best_cost = float('inf')
+        best_cost = float("inf")
         best_left = None
         best_right = None
         for axis in range(3):
             sorted_idx = sorted(indices, key=lambda i: self._compute_centroid(i)[axis])
             prefix_mn = []
             prefix_mx = []
-            cmn = vec3(float('inf'), float('inf'), float('inf'))
-            cmx = vec3(float('-inf'), float('-inf'), float('-inf'))
+            cmn = vec3(float("inf"), float("inf"), float("inf"))
+            cmx = vec3(float("-inf"), float("-inf"), float("-inf"))
             for idx in sorted_idx:
                 amin, amax = self._aabb_of(idx)
                 cmn, cmx = _merge_aabb(cmn, cmx, amin, amax)
@@ -157,8 +194,8 @@ class BVHBuilder:
                 prefix_mx.append(vec3(cmx[0], cmx[1], cmx[2]))
             suffix_mn = [None] * n
             suffix_mx = [None] * n
-            cmn = vec3(float('inf'), float('inf'), float('inf'))
-            cmx = vec3(float('-inf'), float('-inf'), float('-inf'))
+            cmn = vec3(float("inf"), float("inf"), float("inf"))
+            cmx = vec3(float("-inf"), float("-inf"), float("-inf"))
             for j in range(n - 1, -1, -1):
                 idx = sorted_idx[j]
                 amin, amax = self._aabb_of(idx)
@@ -168,7 +205,9 @@ class BVHBuilder:
             for k in range(1, n):
                 lmn, lmx = (prefix_mn[k - 1], prefix_mx[k - 1])
                 rmn, rmx = (suffix_mn[k], suffix_mx[k])
-                cost = k * _aabb_surface_area(lmn, lmx) + (n - k) * _aabb_surface_area(rmn, rmx)
+                cost = k * _aabb_surface_area(lmn, lmx) + (n - k) * _aabb_surface_area(
+                    rmn, rmx
+                )
                 if cost < best_cost:
                     best_cost = cost
                     best_left = sorted_idx[:k]
@@ -179,7 +218,9 @@ class BVHBuilder:
 
     def _median_partition(self, indices):
         node_mn, node_mx = self._compute_bounds(indices)
-        extent = vec3(node_mx[0] - node_mn[0], node_mx[1] - node_mn[1], node_mx[2] - node_mn[2])
+        extent = vec3(
+            node_mx[0] - node_mn[0], node_mx[1] - node_mn[1], node_mx[2] - node_mn[2]
+        )
         if extent[0] >= extent[1] and extent[0] >= extent[2]:
             axis = 0
         elif extent[1] >= extent[2]:
@@ -203,7 +244,7 @@ class BVHBuilder:
             for idx in indices:
                 self.ordered_prim_indices.append(self._prim_storage_index(idx))
             return node
-        if self.split == 'median':
+        if self.split == "median":
             left_indices, right_indices = self._median_partition(indices)
         else:
             left_indices, right_indices = self._sah_partition(indices)
@@ -229,13 +270,31 @@ class BVHBuilder:
             left = self.nodes[2 * idx] if 2 * idx < len(self.nodes) else None
             right = self.nodes[2 * idx + 1] if 2 * idx + 1 < len(self.nodes) else None
             if left is not None and right is not None:
-                node.aabb_min, node.aabb_max = _merge_aabb(left.aabb_min, left.aabb_max, right.aabb_min, right.aabb_max)
+                node.aabb_min, node.aabb_max = _merge_aabb(
+                    left.aabb_min, left.aabb_max, right.aabb_min, right.aabb_max
+                )
             elif left is not None:
-                node.aabb_min = vec3(float(left.aabb_min[0]), float(left.aabb_min[1]), float(left.aabb_min[2]))
-                node.aabb_max = vec3(float(left.aabb_max[0]), float(left.aabb_max[1]), float(left.aabb_max[2]))
+                node.aabb_min = vec3(
+                    float(left.aabb_min[0]),
+                    float(left.aabb_min[1]),
+                    float(left.aabb_min[2]),
+                )
+                node.aabb_max = vec3(
+                    float(left.aabb_max[0]),
+                    float(left.aabb_max[1]),
+                    float(left.aabb_max[2]),
+                )
             elif right is not None:
-                node.aabb_min = vec3(float(right.aabb_min[0]), float(right.aabb_min[1]), float(right.aabb_min[2]))
-                node.aabb_max = vec3(float(right.aabb_max[0]), float(right.aabb_max[1]), float(right.aabb_max[2]))
+                node.aabb_min = vec3(
+                    float(right.aabb_min[0]),
+                    float(right.aabb_min[1]),
+                    float(right.aabb_min[2]),
+                )
+                node.aabb_max = vec3(
+                    float(right.aabb_max[0]),
+                    float(right.aabb_max[1]),
+                    float(right.aabb_max[2]),
+                )
 
     def _get_depth(self, node):
         if node is None or node.is_leaf:
@@ -259,6 +318,7 @@ class BVHBuilder:
                 return i
         return 0
 
+
 @ti.data_oriented
 class BVH:
     MAX_STACK_DEPTH = 64
@@ -273,8 +333,10 @@ class BVH:
             radius = s.radius
             aabb_min = vec3(s.aabb.x.min, s.aabb.y.min, s.aabb.z.min)
             aabb_max = vec3(s.aabb.x.max, s.aabb.y.max, s.aabb.z.max)
-            spheres_data.append((center[0], center[1], center[2], radius, i, aabb_min, aabb_max))
-        builder = BVHBuilder(spheres_data, split='sah')
+            spheres_data.append(
+                (center[0], center[1], center[2], radius, i, aabb_min, aabb_max)
+            )
+        builder = BVHBuilder(spheres_data, split="sah")
         builder.build()
         max_idx = max(builder.get_max_index(), 1)
         self.nodes = BVHNode.field(shape=(max_idx + 1,))
@@ -288,15 +350,31 @@ class BVH:
     def _upload_to_gpu(self, builder):
         for i in range(1, self.node_count + 1):
             node = builder.nodes[i]
-            if node is not None:
-                self.nodes[i] = BVHNode(aabb_min=node.aabb_min, aabb_max=node.aabb_max, is_leaf=1 if node.is_leaf else 0, first_prim=node.first_prim, prim_count=node.prim_count)
+            if node is None:
+                self.nodes[i].aabb_min = vec3(0, 0, 0)
+                self.nodes[i].aabb_max = vec3(0, 0, 0)
+                self.nodes[i].left_or_first = 0
+                self.nodes[i].count = 0
+                self.nodes[i].prim_count = 0
+            elif node.is_leaf:
+                self.nodes[i].aabb_min = node.aabb_min
+                self.nodes[i].aabb_max = node.aabb_max
+                self.nodes[i].left_or_first = int(node.first_prim)
+                self.nodes[i].count = int(node.prim_count)
+                self.nodes[i].prim_count = int(node.prim_count)
             else:
-                self.nodes[i] = BVHNode(aabb_min=vec3(0, 0, 0), aabb_max=vec3(0, 0, 0), is_leaf=0, first_prim=0, prim_count=0)
+                self.nodes[i].aabb_min = node.aabb_min
+                self.nodes[i].aabb_max = node.aabb_max
+                self.nodes[i].left_or_first = 2 * i                              
+                self.nodes[i].count = 0
+                self.nodes[i].prim_count = 0
         for i, idx in enumerate(builder.ordered_prim_indices):
             self.prim_indices[i] = idx
 
     @ti.func
-    def hit(self, r: Ray, ray_t: Interval, rec, temp_rec, x: ti.i32, y: ti.i32) -> ti.i32:
+    def hit(
+        self, r: Ray, ray_t: Interval, rec, temp_rec, x: ti.i32, y: ti.i32
+    ) -> ti.i32:
         did_hit = 0
         closest_so_far = ray_t.max
         stack = ti.Vector([0] * 64, dt=ti.i32)
@@ -306,14 +384,16 @@ class BVH:
         while (step < 1000) & ((current > 0) | (stack_ptr > 0)):
             step += 1
             if current > 0 and current <= self.node_count:
-                node_idx = current
-                node = self.nodes[node_idx]
+                node = self.nodes[current]
+                cur = current
                 current = 0
                 if aabb_hit(node.aabb_min, node.aabb_max, r, ray_t.min, closest_so_far):
-                    if node.is_leaf == 1:
-                        for i in range(node.prim_count):
-                            prim_idx = self.prim_indices[node.first_prim + i]
-                            if self.spheres[prim_idx].hit(r, Interval(ray_t.min, closest_so_far), temp_rec):
+                    if node.count > 0:        
+                        for i in range(node.count):
+                            prim_idx = self.prim_indices[node.left_or_first + i]
+                            if self.spheres[prim_idx].hit(
+                                r, Interval(ray_t.min, closest_so_far), temp_rec
+                            ):
                                 did_hit = 1
                                 closest_so_far = temp_rec[None].t
                                 rec[x, y].t = temp_rec[None].t
@@ -323,9 +403,9 @@ class BVH:
                                 rec[x, y].normal = temp_rec[None].normal
                                 rec[x, y].front_face = temp_rec[None].front_face
                                 rec[x, y].mat_id = temp_rec[None].mat_id
-                    else:
-                        left_child = 2 * node_idx
-                        right_child = 2 * node_idx + 1
+                    else:                                                                
+                        left_child = node.left_or_first
+                        right_child = node.left_or_first + 1
                         if right_child <= self.node_count and stack_ptr < 63:
                             stack[stack_ptr] = right_child
                             stack_ptr += 1
@@ -339,11 +419,12 @@ class BVH:
                 break
         return did_hit
 
+
 @ti.data_oriented
 class GPULBVHBuilder:
     MAX_LEAF_SIZE = 4
 
-    def __init__(self, primitives_data, layout: str='prim'):
+    def __init__(self, primitives_data, layout: str = "prim"):
         self.layout = layout
         self.primitives = primitives_data
         self.ordered_prim_indices = []
@@ -352,13 +433,13 @@ class GPULBVHBuilder:
 
     def _aabb_of(self, idx):
         prim = self.primitives[idx]
-        if self.layout == 'sphere':
+        if self.layout == "sphere":
             return (prim[5], prim[6])
         return (prim[0], prim[1])
 
     def _prim_storage_index(self, idx):
         prim = self.primitives[idx]
-        if self.layout == 'sphere':
+        if self.layout == "sphere":
             return prim[4]
         return prim[2]
 
@@ -403,13 +484,29 @@ class GPULBVHBuilder:
     @staticmethod
     @ti.func
     def _morton3d_gpu(x: ti.f32, y: ti.f32, z: ti.f32) -> ti.u32:
-        xx = GPULBVHBuilder._expand_bits_gpu(ti.cast(ti.math.clamp(x, 0.0, 1.0) * 1023.0, ti.u32))
-        yy = GPULBVHBuilder._expand_bits_gpu(ti.cast(ti.math.clamp(y, 0.0, 1.0) * 1023.0, ti.u32))
-        zz = GPULBVHBuilder._expand_bits_gpu(ti.cast(ti.math.clamp(z, 0.0, 1.0) * 1023.0, ti.u32))
+        xx = GPULBVHBuilder._expand_bits_gpu(
+            ti.cast(ti.math.clamp(x, 0.0, 1.0) * 1023.0, ti.u32)
+        )
+        yy = GPULBVHBuilder._expand_bits_gpu(
+            ti.cast(ti.math.clamp(y, 0.0, 1.0) * 1023.0, ti.u32)
+        )
+        zz = GPULBVHBuilder._expand_bits_gpu(
+            ti.cast(ti.math.clamp(z, 0.0, 1.0) * 1023.0, ti.u32)
+        )
         return xx << ti.u32(2) | yy << ti.u32(1) | zz
 
     @ti.kernel
-    def _compute_morton_codes(self, mins: ti.template(), maxs: ti.template(), codes: ti.template(), values: ti.template(), sort_count: ti.i32, prim_count: ti.i32, scene_min: vec3, inv_extent: vec3):
+    def _compute_morton_codes(
+        self,
+        mins: ti.template(),
+        maxs: ti.template(),
+        codes: ti.template(),
+        values: ti.template(),
+        sort_count: ti.i32,
+        prim_count: ti.i32,
+        scene_min: vec3,
+        inv_extent: vec3,
+    ):
         for i in range(sort_count):
             if i < prim_count:
                 mn = mins[i]
@@ -423,7 +520,14 @@ class GPULBVHBuilder:
                 values[i] = i
 
     @ti.kernel
-    def _bitonic_sort_step(self, codes: ti.template(), values: ti.template(), sort_count: ti.i32, j: ti.i32, k: ti.i32):
+    def _bitonic_sort_step(
+        self,
+        codes: ti.template(),
+        values: ti.template(),
+        sort_count: ti.i32,
+        j: ti.i32,
+        k: ti.i32,
+    ):
         for i in range(sort_count):
             ixj = i ^ j
             if ixj > i:
@@ -445,8 +549,8 @@ class GPULBVHBuilder:
         n = len(self.primitives)
         if n == 0:
             return
-        scene_min = [float('inf')] * 3
-        scene_max = [float('-inf')] * 3
+        scene_min = [float("inf")] * 3
+        scene_max = [float("-inf")] * 3
         centroids = []
         for idx in range(n):
             mn, mx = self._aabb_of(idx)
@@ -469,7 +573,16 @@ class GPULBVHBuilder:
             mn, mx = self._aabb_of(idx)
             mins[idx] = mn
             maxs[idx] = mx
-        self._compute_morton_codes(mins, maxs, codes, values, sort_count, n, vec3(scene_min[0], scene_min[1], scene_min[2]), vec3(1.0 / extent[0], 1.0 / extent[1], 1.0 / extent[2]))
+        self._compute_morton_codes(
+            mins,
+            maxs,
+            codes,
+            values,
+            sort_count,
+            n,
+            vec3(scene_min[0], scene_min[1], scene_min[2]),
+            vec3(1.0 / extent[0], 1.0 / extent[1], 1.0 / extent[2]),
+        )
         k = 2
         while k <= sort_count:
             j = k // 2
@@ -479,7 +592,9 @@ class GPULBVHBuilder:
             k *= 2
         ti.sync()
         sorted_indices = [int(i) for i in values.to_numpy()[:n]]
-        self.ordered_prim_indices = [self._prim_storage_index(idx) for idx in sorted_indices]
+        self.ordered_prim_indices = [
+            self._prim_storage_index(idx) for idx in sorted_indices
+        ]
         self._build_morton_heap(sorted_indices)
 
     def _build_morton_heap(self, sorted_indices):
@@ -489,8 +604,8 @@ class GPULBVHBuilder:
         while base < leaf_count:
             base *= 2
         self.nodes = [None] * (2 * base)
-        empty_min = vec3(1e+30, 1e+30, 1e+30)
-        empty_max = vec3(-1e+30, -1e+30, -1e+30)
+        empty_min = vec3(1e30, 1e30, 1e30)
+        empty_max = vec3(-1e30, -1e30, -1e30)
         for leaf in range(base):
             node = PythonBVHNode()
             start = leaf * self.MAX_LEAF_SIZE
@@ -504,7 +619,9 @@ class GPULBVHBuilder:
                 node.aabb_max = vec3(mx[0], mx[1], mx[2])
                 for k in range(start + 1, end):
                     kmn, kmx = self._aabb_of(sorted_indices[k])
-                    node.aabb_min, node.aabb_max = _merge_aabb(node.aabb_min, node.aabb_max, kmn, kmx)
+                    node.aabb_min, node.aabb_max = _merge_aabb(
+                        node.aabb_min, node.aabb_max, kmn, kmx
+                    )
             else:
                 node.aabb_min = empty_min
                 node.aabb_max = empty_max
@@ -518,7 +635,9 @@ class GPULBVHBuilder:
             node.is_leaf = False
             node.first_prim = 0
             node.prim_count = 0
-            node.aabb_min, node.aabb_max = _merge_aabb(left.aabb_min, left.aabb_max, right.aabb_min, right.aabb_max)
+            node.aabb_min, node.aabb_max = _merge_aabb(
+                left.aabb_min, left.aabb_max, right.aabb_min, right.aabb_max
+            )
             self.nodes[idx] = node
         self.root = self.nodes[1]
 

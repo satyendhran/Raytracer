@@ -1,5 +1,6 @@
 import taichi as ti
 
+
 @ti.dataclass
 class Interval:
     min: ti.f32

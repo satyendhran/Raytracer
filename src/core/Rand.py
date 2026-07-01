@@ -1,13 +1,16 @@
 import taichi as ti
 import taichi.math as tm
 
+
 @ti.func
 def random_double(a: ti.f32, b: ti.f32) -> ti.f32:
     return a + (b - a) * ti.random()
 
+
 @ti.func
 def random_vec3(a: ti.f32, b: ti.f32) -> tm.vec3:
     return tm.vec3(random_double(a, b), random_double(a, b), random_double(a, b))
+
 
 @ti.func
 def random_unit_vec3() -> tm.vec3:
@@ -15,6 +18,7 @@ def random_unit_vec3() -> tm.vec3:
     r = ti.sqrt(ti.max(1.0 - z * z, 0.0))
     phi = 2.0 * ti.math.pi * ti.random()
     return tm.vec3(r * ti.cos(phi), r * ti.sin(phi), z)
+
 
 @ti.func
 def random_cosine_direction(normal: tm.vec3) -> tm.vec3:
@@ -30,14 +34,19 @@ def random_cosine_direction(normal: tm.vec3) -> tm.vec3:
     bitangent = tm.vec3(b, sign + normal.y * normal.y * a, -normal.y)
     return tm.normalize(local.x * tangent + local.y * bitangent + local.z * normal)
 
+
 @ti.func
 def random_on_hemisphere(normal: tm.vec3) -> tm.vec3:
     on_unit_sphere = random_unit_vec3()
-    return ti.select(tm.dot(on_unit_sphere, normal) > 0.0, on_unit_sphere, -on_unit_sphere)
+    return ti.select(
+        tm.dot(on_unit_sphere, normal) > 0.0, on_unit_sphere, -on_unit_sphere
+    )
+
 
 @ti.func
 def reflect(v: tm.vec3, normal: tm.vec3) -> tm.vec3:
     return v - 2.0 * tm.dot(v, normal) * normal
+
 
 @ti.func
 def refract(uv: tm.vec3, n: tm.vec3, etai_over_etat: ti.f32) -> tm.vec3:
@@ -45,6 +54,7 @@ def refract(uv: tm.vec3, n: tm.vec3, etai_over_etat: ti.f32) -> tm.vec3:
     r_out_perp = etai_over_etat * (uv + cos_theta * n)
     r_out_parallel = -ti.sqrt(ti.max(1.0 - tm.dot(r_out_perp, r_out_perp), 0.0)) * n
     return r_out_perp + r_out_parallel
+
 
 @ti.func
 def random_in_unit_disk() -> tm.vec3:

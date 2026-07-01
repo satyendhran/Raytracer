@@ -6,3 +6,4 @@ output
 tests
 gradient.png
 gradient2.png
+.taichi_cache

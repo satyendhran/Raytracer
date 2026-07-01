@@ -1,8 +1,10 @@
 import taichi as ti
 import taichi.math as tm
-from src.geometry.AABB import AABB
+
 from src.core.interval import Interval
 from src.core.Ray import Ray
+from src.geometry.AABB import AABB
+
 
 @ti.dataclass
 class hit_record:
@@ -23,6 +25,7 @@ class hit_record:
         self.front_face = ti.u8(ti.math.dot(outward_normal, r.direction) < 0)
         self.normal = ti.select(self.front_face, outward_normal, -outward_normal)
 
+
 @ti.func
 def set(set_rec: hit_record, other_rec: hit_record, i, j):
     set_rec[i, j].t = other_rec[None].t
@@ -37,6 +40,7 @@ def set(set_rec: hit_record, other_rec: hit_record, i, j):
     set_rec[i, j].mat_id = other_rec[None].mat_id
     set_rec[i, j].prim_id = other_rec[None].prim_id
 
+
 @ti.func
 def get_sphere_uv(p: ti.math.vec3):
     theta = ti.acos(ti.math.clamp(p.y, -1.0, 1.0))
@@ -44,6 +48,7 @@ def get_sphere_uv(p: ti.math.vec3):
     u = (phi + ti.math.pi) / (2.0 * ti.math.pi)
     v = theta / ti.math.pi
     return (u, v)
+
 
 @ti.dataclass
 class Sphere:
@@ -79,9 +84,9 @@ class Sphere:
                 rec[None].prim_id = -1
         return ret
 
+
 @ti.data_oriented
 class Hittable_list:
-
     def __init__(self, no_of_spheres):
         self.spheres = Sphere.field(shape=no_of_spheres)
         self.sphere_counter = ti.field(dtype=ti.i32, shape=())
@@ -112,7 +117,9 @@ class Hittable_list:
         did_hit = False
         closest_so_far = ray_t.max
         for i in range(self.sphere_counter[None]):
-            if self.spheres[i].hit(r, Interval(ray_t.min, closest_so_far), self.temp_rec):
+            if self.spheres[i].hit(
+                r, Interval(ray_t.min, closest_so_far), self.temp_rec
+            ):
                 did_hit = True
                 closest_so_far = self.temp_rec[None].t
                 set(rec, self.temp_rec, x, y)

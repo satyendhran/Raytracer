@@ -1,6 +1,9 @@
 import taichi as ti
+
 from src.core.interval import Interval
+
 vec3 = ti.math.vec3
+
 
 @ti.dataclass
 class AABB:
@@ -37,6 +40,7 @@ class AABB:
                     no_hit = True
         return ti.select(no_hit, 0, 1)
 
+
 @ti.func
 def init_aabb(a, b):
     x = Interval(a[0], b[0]) if a[0] <= b[0] else Interval(b[0], a[0])
@@ -44,6 +48,18 @@ def init_aabb(a, b):
     z = Interval(a[2], b[2]) if a[2] <= b[2] else Interval(b[2], a[2])
     return AABB(x, y, z)
 
+
 @ti.func
 def init_aabb_2(box1, box2):
-    return init_aabb(vec3(min(box1.x.min, box2.x.min), min(box1.y.min, box2.y.min), min(box1.z.min, box2.z.min)), vec3(max(box1.x.max, box2.x.max), max(box1.y.max, box2.y.max), max(box1.z.max, box2.z.max)))
+    return init_aabb(
+        vec3(
+            min(box1.x.min, box2.x.min),
+            min(box1.y.min, box2.y.min),
+            min(box1.z.min, box2.z.min),
+        ),
+        vec3(
+            max(box1.x.max, box2.x.max),
+            max(box1.y.max, box2.y.max),
+            max(box1.z.max, box2.z.max),
+        ),
+    )

@@ -1,12 +1,16 @@
 import math
+
 import numpy as np
 import taichi as ti
 import taichi.math as tm
-from tools import debug_tools
-from src.accel.BVH import BVHBuilder, BVHNode, GPULBVHBuilder, aabb_hit, aabb_ray_t_enter
+
+from src.accel.BVH import BVHBuilder, BVHNode, aabb_hit, aabb_ray_t_enter
+from src.accel.BVHGPUSAH import GPUSAHBVHBuilder
 from src.core.interval import Interval
-from src.geometry.Objects import get_sphere_uv
 from src.core.Ray import Ray
+from src.geometry.Objects import get_sphere_uv
+from tools import debug_tools
+
 vec3 = tm.vec3
 KIND_SPHERE = 0
 KIND_BOX = 1
@@ -20,19 +24,49 @@ SDF_ROUNDED_BOX = 2
 BVH_FLAT_EPS = 0.0001
 TRI_DET_EPS = 1e-08
 BARY_EPS = 1e-06
-RAY_T_MAX_DEFAULT = 1e+30
+RAY_T_MAX_DEFAULT = 1e30
 PRIM_FLAG_INVISIBLE_PRIMARY = 1 << 16
 PRIM_FLAG_ONE_WAY_INSIDE = 1 << 17
 PRIM_FLAG_TWO_SIDED = 1 << 18
 SDF_KIND_MASK = 255
-ScenePrimitive = ti.types.struct(kind=ti.i32, mat_id=ti.i32, center0=vec3, center_vel=vec3, radius=ti.f32, box_min=vec3, box_max=vec3, bvh_min=vec3, bvh_max=vec3, sdf_kind=ti.i32, n0=vec3, n1=vec3, n2=vec3, uv0=vec3, uv1=vec3, uv2=vec3)
+ScenePrimitive = ti.types.struct(
+    kind=ti.i32,
+    mat_id=ti.i32,
+    center0=vec3,
+    center_vel=vec3,
+    radius=ti.f32,
+    box_min=vec3,
+    box_max=vec3,
+    bvh_min=vec3,
+    bvh_max=vec3,
+    sdf_kind=ti.i32,
+    n0=vec3,
+    n1=vec3,
+    n2=vec3,
+    uv0=vec3,
+    uv1=vec3,
+    uv2=vec3,
+)
+
 
 @ti.func
 def _sphere_center_at(p: ScenePrimitive, t: ti.f32) -> vec3:
     return p.center0 + p.center_vel * t
 
+
 @ti.func
-def _mt_triangle_intersect(v0: vec3, e1: vec3, e2: vec3, geom_n: vec3, plane_d: ti.f32, origin: vec3, direction: vec3, t_min: ti.f32, t_max: ti.f32, two_sided: ti.i32):
+def _mt_triangle_intersect(
+    v0: vec3,
+    e1: vec3,
+    e2: vec3,
+    geom_n: vec3,
+    plane_d: ti.f32,
+    origin: vec3,
+    direction: vec3,
+    t_min: ti.f32,
+    t_max: ti.f32,
+    two_sided: ti.i32,
+):
     nd = tm.dot(geom_n, direction)
     plane_ok = ti.cast(1, ti.i32)
     if ti.abs(nd) >= TRI_DET_EPS:
@@ -52,7 +86,12 @@ def _mt_triangle_intersect(v0: vec3, e1: vec3, e2: vec3, geom_n: vec3, plane_d: 
     qvec = tm.cross(tvec, e1)
     vv = tm.dot(direction, qvec) * inv_det
     root = tm.dot(e2, qvec) * inv_det
-    bary_ok = (uu >= -BARY_EPS) & (uu <= 1.0 + BARY_EPS) & (vv >= -BARY_EPS) & (uu + vv <= 1.0 + BARY_EPS)
+    bary_ok = (
+        (uu >= -BARY_EPS)
+        & (uu <= 1.0 + BARY_EPS)
+        & (vv >= -BARY_EPS)
+        & (uu + vv <= 1.0 + BARY_EPS)
+    )
     t_ok = (root > t_min) & (root < t_max)
     valid = (plane_ok != 0) & (face_ok != 0) & bary_ok & t_ok
     hit_ok = ti.cast(valid, ti.i32)
@@ -61,8 +100,11 @@ def _mt_triangle_intersect(v0: vec3, e1: vec3, e2: vec3, geom_n: vec3, plane_d: 
     out_v = ti.select(valid, vv, 0.0)
     return (hit_ok, out_t, out_u, out_v)
 
+
 @ti.func
-def _hit_sphere(p: ScenePrimitive, r: Ray, ray_t: Interval, rec, xi: ti.i32, yi: ti.i32) -> ti.u8:
+def _hit_sphere(
+    p: ScenePrimitive, r: Ray, ray_t: Interval, rec, xi: ti.i32, yi: ti.i32
+) -> ti.u8:
     current_centre = _sphere_center_at(p, r.tm)
     oc = current_centre - r.origin
     d = r.direction
@@ -97,8 +139,11 @@ def _hit_sphere(p: ScenePrimitive, r: Ray, ray_t: Interval, rec, xi: ti.i32, yi:
             ret = ti.cast(1, ti.u8)
     return ret
 
+
 @ti.func
-def _hit_box(p: ScenePrimitive, r: Ray, ray_t: Interval, rec, xi: ti.i32, yi: ti.i32) -> ti.u8:
+def _hit_box(
+    p: ScenePrimitive, r: Ray, ray_t: Interval, rec, xi: ti.i32, yi: ti.i32
+) -> ti.u8:
     t0 = ray_t.min
     t1 = ray_t.max
     bmin = p.box_min
@@ -158,15 +203,29 @@ def _hit_box(p: ScenePrimitive, r: Ray, ray_t: Interval, rec, xi: ti.i32, yi: ti
         rec[xi, yi].prim_id = -1
     return ti.select(valid, ti.cast(1, ti.u8), ti.cast(0, ti.u8))
 
+
 @ti.func
-def _hit_triangle(p: ScenePrimitive, r: Ray, ray_t: Interval, rec, xi: ti.i32, yi: ti.i32) -> ti.u8:
+def _hit_triangle(
+    p: ScenePrimitive, r: Ray, ray_t: Interval, rec, xi: ti.i32, yi: ti.i32
+) -> ti.u8:
     v0 = p.center0
     e1 = p.center_vel
     e2 = p.box_min
     geom_n = p.box_max
     plane_d = tm.dot(geom_n, v0)
     two_sided = ti.cast(p.sdf_kind & PRIM_FLAG_TWO_SIDED != 0, ti.i32)
-    hit_ok, root, uu, vv = _mt_triangle_intersect(v0, e1, e2, geom_n, plane_d, r.origin, r.direction, ray_t.min, ray_t.max, two_sided)
+    hit_ok, root, uu, vv = _mt_triangle_intersect(
+        v0,
+        e1,
+        e2,
+        geom_n,
+        plane_d,
+        r.origin,
+        r.direction,
+        ray_t.min,
+        ray_t.max,
+        two_sided,
+    )
     valid = hit_ok != 0
     if valid:
         rec[xi, yi].t = root
@@ -200,8 +259,11 @@ def _hit_triangle(p: ScenePrimitive, r: Ray, ray_t: Interval, rec, xi: ti.i32, y
         rec[xi, yi].v = ti.math.clamp(tex_v, 0.0, 1.0)
     return ti.select(valid, ti.cast(1, ti.u8), ti.cast(0, ti.u8))
 
+
 @ti.func
-def _hit_quad(p: ScenePrimitive, r: Ray, ray_t: Interval, rec, xi: ti.i32, yi: ti.i32) -> ti.u8:
+def _hit_quad(
+    p: ScenePrimitive, r: Ray, ray_t: Interval, rec, xi: ti.i32, yi: ti.i32
+) -> ti.u8:
     Q = p.center0
     u = p.center_vel
     v = p.box_min
@@ -235,8 +297,11 @@ def _hit_quad(p: ScenePrimitive, r: Ray, ray_t: Interval, rec, xi: ti.i32, yi: t
         rec[xi, yi].v = beta
     return ti.select(valid, ti.cast(1, ti.u8), ti.cast(0, ti.u8))
 
+
 @ti.func
-def _hit_ellipsoid(p: ScenePrimitive, r: Ray, ray_t: Interval, rec, xi: ti.i32, yi: ti.i32) -> ti.u8:
+def _hit_ellipsoid(
+    p: ScenePrimitive, r: Ray, ray_t: Interval, rec, xi: ti.i32, yi: ti.i32
+) -> ti.u8:
     c = p.center0
     rad = p.box_min
     ro = (r.origin - c) / rad
@@ -268,6 +333,7 @@ def _hit_ellipsoid(p: ScenePrimitive, r: Ray, ray_t: Interval, rec, xi: ti.i32, 
             ret = ti.cast(1, ti.u8)
     return ret
 
+
 @ti.func
 def _sdf_eval(p: ScenePrimitive, pw: vec3) -> ti.f32:
     lp = pw - p.center0
@@ -296,8 +362,11 @@ def _sdf_eval(p: ScenePrimitive, pw: vec3) -> ti.f32:
         d = outer + inner - cr
     return d
 
+
 @ti.func
-def _hit_sdf(p: ScenePrimitive, r: Ray, ray_t: Interval, rec, xi: ti.i32, yi: ti.i32) -> ti.u8:
+def _hit_sdf(
+    p: ScenePrimitive, r: Ray, ray_t: Interval, rec, xi: ti.i32, yi: ti.i32
+) -> ti.u8:
     valid = ti.cast(0, ti.u8)
     t = ray_t.min
     prev_d = 10000000000.0
@@ -315,9 +384,15 @@ def _hit_sdf(p: ScenePrimitive, r: Ray, ray_t: Interval, rec, xi: ti.i32, yi: ti
     if valid != 0:
         pw = r.at(t)
         eps = 5e-05
-        nx = _sdf_eval(p, pw + vec3(eps, 0.0, 0.0)) - _sdf_eval(p, pw - vec3(eps, 0.0, 0.0))
-        ny = _sdf_eval(p, pw + vec3(0.0, eps, 0.0)) - _sdf_eval(p, pw - vec3(0.0, eps, 0.0))
-        nz = _sdf_eval(p, pw + vec3(0.0, 0.0, eps)) - _sdf_eval(p, pw - vec3(0.0, 0.0, eps))
+        nx = _sdf_eval(p, pw + vec3(eps, 0.0, 0.0)) - _sdf_eval(
+            p, pw - vec3(eps, 0.0, 0.0)
+        )
+        ny = _sdf_eval(p, pw + vec3(0.0, eps, 0.0)) - _sdf_eval(
+            p, pw - vec3(0.0, eps, 0.0)
+        )
+        nz = _sdf_eval(p, pw + vec3(0.0, 0.0, eps)) - _sdf_eval(
+            p, pw - vec3(0.0, 0.0, eps)
+        )
         n = tm.normalize(vec3(nx, ny, nz))
         rec[xi, yi].t = t
         rec[xi, yi].p = pw
@@ -326,6 +401,7 @@ def _hit_sdf(p: ScenePrimitive, r: Ray, ray_t: Interval, rec, xi: ti.i32, yi: ti
         rec[xi, yi].prim_id = -1
         rec[xi, yi].u, rec[xi, yi].v = get_sphere_uv(n)
     return valid
+
 
 @ti.func
 def _occludes_sphere(p: ScenePrimitive, r: Ray, ray_t: Interval) -> ti.i32:
@@ -345,6 +421,7 @@ def _occludes_sphere(p: ScenePrimitive, r: Ray, ray_t: Interval) -> ti.i32:
         ret = ti.select(ray_t.surrounds(t0) | ray_t.surrounds(t1), 1, 0)
     return ret
 
+
 @ti.func
 def _occludes_triangle(p: ScenePrimitive, r: Ray, ray_t: Interval) -> ti.i32:
     v0 = p.center0
@@ -353,8 +430,20 @@ def _occludes_triangle(p: ScenePrimitive, r: Ray, ray_t: Interval) -> ti.i32:
     geom_n = p.box_max
     plane_d = tm.dot(geom_n, v0)
     two_sided = ti.cast(p.sdf_kind & PRIM_FLAG_TWO_SIDED != 0, ti.i32)
-    hit_ok, _, _, _ = _mt_triangle_intersect(v0, e1, e2, geom_n, plane_d, r.origin, r.direction, ray_t.min, ray_t.max, two_sided)
+    hit_ok, _, _, _ = _mt_triangle_intersect(
+        v0,
+        e1,
+        e2,
+        geom_n,
+        plane_d,
+        r.origin,
+        r.direction,
+        ray_t.min,
+        ray_t.max,
+        two_sided,
+    )
     return hit_ok
+
 
 @ti.func
 def _occludes_quad(p: ScenePrimitive, r: Ray, ray_t: Interval) -> ti.i32:
@@ -378,8 +467,17 @@ def _occludes_quad(p: ScenePrimitive, r: Ray, ray_t: Interval) -> ti.i32:
             inv_det = 1.0 / det
             alpha = (wu * vv - wv * uv) * inv_det
             beta = (uu * wv - uv * wu) * inv_det
-            ret = ti.select(ray_t.surrounds(t) & (alpha >= 0.0) & (alpha <= 1.0) & (beta >= 0.0) & (beta <= 1.0), 1, 0)
+            ret = ti.select(
+                ray_t.surrounds(t)
+                & (alpha >= 0.0)
+                & (alpha <= 1.0)
+                & (beta >= 0.0)
+                & (beta <= 1.0),
+                1,
+                0,
+            )
     return ret
+
 
 @ti.func
 def _occludes_ellipsoid(p: ScenePrimitive, r: Ray, ray_t: Interval) -> ti.i32:
@@ -399,6 +497,7 @@ def _occludes_ellipsoid(p: ScenePrimitive, r: Ray, ray_t: Interval) -> ti.i32:
         ret = ti.select(ray_t.surrounds(t0) | ray_t.surrounds(t1), 1, 0)
     return ret
 
+
 @ti.func
 def _occludes_sdf(p: ScenePrimitive, r: Ray, ray_t: Interval) -> ti.i32:
     ret = 0
@@ -416,6 +515,7 @@ def _occludes_sdf(p: ScenePrimitive, r: Ray, ray_t: Interval) -> ti.i32:
             break
     return ret
 
+
 @ti.func
 def _skip_one_way_inside(p: ScenePrimitive, r: Ray) -> ti.i32:
     skip = 0
@@ -424,6 +524,7 @@ def _skip_one_way_inside(p: ScenePrimitive, r: Ray) -> ti.i32:
         moving_toward_inside = tm.dot(r.direction, p.box_max) > 0.0
         skip = ti.select((side < 0.0) & moving_toward_inside, 1, 0)
     return skip
+
 
 @ti.func
 def primitive_any_hit(p: ScenePrimitive, r: Ray, ray_t: Interval) -> ti.i32:
@@ -443,8 +544,11 @@ def primitive_any_hit(p: ScenePrimitive, r: Ray, ray_t: Interval) -> ti.i32:
             ret = _occludes_ellipsoid(p, r, ray_t)
     return ret
 
+
 @ti.func
-def primitive_hit(p: ScenePrimitive, r: Ray, ray_t: Interval, rec, xi: ti.i32, yi: ti.i32) -> ti.u8:
+def primitive_hit(
+    p: ScenePrimitive, r: Ray, ray_t: Interval, rec, xi: ti.i32, yi: ti.i32
+) -> ti.u8:
     ret = ti.cast(0, ti.u8)
     skip_primary = (p.sdf_kind & PRIM_FLAG_INVISIBLE_PRIMARY != 0) & (r.kind == 0)
     skip_one_way = _skip_one_way_inside(p, r) != 0
@@ -463,19 +567,29 @@ def primitive_hit(p: ScenePrimitive, r: Ray, ray_t: Interval, rec, xi: ti.i32, y
             ret = _hit_ellipsoid(p, r, ray_t, rec, xi, yi)
     return ret
 
+
 def _sphere_world_aabb(c1, c2, r):
-    v = c2 - c1
+    c2 - c1
     rvec = vec3(r, r, r)
     min1, max1 = (c1 - rvec, c1 + rvec)
     aabb_min = vec3(min(min1[0], max1[0]), min(min1[1], max1[1]), min(min1[2], max1[2]))
     aabb_max = vec3(max(min1[0], max1[0]), max(min1[1], max1[1]), max(min1[2], max1[2]))
     if c1[0] != c2[0] or c1[1] != c2[1] or c1[2] != c2[2]:
         min2, max2 = (c2 - rvec, c2 + rvec)
-        aabb_min = vec3(min(aabb_min[0], min2[0], max2[0]), min(aabb_min[1], min2[1], max2[1]), min(aabb_min[2], min2[2], max2[2]))
-        aabb_max = vec3(max(aabb_max[0], min2[0], max2[0]), max(aabb_max[1], min2[1], max2[1]), max(aabb_max[2], min2[2], max2[2]))
+        aabb_min = vec3(
+            min(aabb_min[0], min2[0], max2[0]),
+            min(aabb_min[1], min2[1], max2[1]),
+            min(aabb_min[2], min2[2], max2[2]),
+        )
+        aabb_max = vec3(
+            max(aabb_max[0], min2[0], max2[0]),
+            max(aabb_max[1], min2[1], max2[1]),
+            max(aabb_max[2], min2[2], max2[2]),
+        )
     return (aabb_min, aabb_max)
 
-def _pad_degenerate_aabb(aabb_min: vec3, aabb_max: vec3, eps: float=BVH_FLAT_EPS):
+
+def _pad_degenerate_aabb(aabb_min: vec3, aabb_max: vec3, eps: float = BVH_FLAT_EPS):
     mn = [float(aabb_min[0]), float(aabb_min[1]), float(aabb_min[2])]
     mx = [float(aabb_max[0]), float(aabb_max[1]), float(aabb_max[2])]
     for axis in range(3):
@@ -485,21 +599,60 @@ def _pad_degenerate_aabb(aabb_min: vec3, aabb_max: vec3, eps: float=BVH_FLAT_EPS
             mx[axis] = center + 0.5 * eps
     return (vec3(mn[0], mn[1], mn[2]), vec3(mx[0], mx[1], mx[2]))
 
+
 def scene_primitive_sphere(c1, c2, r, mat_id: int) -> ScenePrimitive:
     aabb_min, aabb_max = _sphere_world_aabb(c1, c2, r)
     v = c2 - c1
     r_sq = float(r) * float(r)
-    return ScenePrimitive(kind=KIND_SPHERE, mat_id=mat_id, center0=c1, center_vel=v, radius=r, box_min=vec3(r_sq, r_sq, r_sq), box_max=vec3(0.0), bvh_min=aabb_min, bvh_max=aabb_max)
+    return ScenePrimitive(
+        kind=KIND_SPHERE,
+        mat_id=mat_id,
+        center0=c1,
+        center_vel=v,
+        radius=r,
+        box_min=vec3(r_sq, r_sq, r_sq),
+        box_max=vec3(0.0),
+        bvh_min=aabb_min,
+        bvh_max=aabb_max,
+    )
+
 
 def scene_primitive_box(bmin, bmax, mat_id: int) -> ScenePrimitive:
-    return ScenePrimitive(kind=KIND_BOX, mat_id=mat_id, center0=vec3(0.0), center_vel=vec3(0.0), radius=0.0, box_min=bmin, box_max=bmax, bvh_min=bmin, bvh_max=bmax)
+    return ScenePrimitive(
+        kind=KIND_BOX,
+        mat_id=mat_id,
+        center0=vec3(0.0),
+        center_vel=vec3(0.0),
+        radius=0.0,
+        box_min=bmin,
+        box_max=bmax,
+        bvh_min=bmin,
+        bvh_max=bmax,
+    )
+
 
 def _componentwise_min_max(p0: vec3, p1: vec3, p2: vec3):
-    mn = vec3(min(p0[0], p1[0], p2[0]), min(p0[1], p1[1], p2[1]), min(p0[2], p1[2], p2[2]))
-    mx = vec3(max(p0[0], p1[0], p2[0]), max(p0[1], p1[1], p2[1]), max(p0[2], p1[2], p2[2]))
+    mn = vec3(
+        min(p0[0], p1[0], p2[0]), min(p0[1], p1[1], p2[1]), min(p0[2], p1[2], p2[2])
+    )
+    mx = vec3(
+        max(p0[0], p1[0], p2[0]), max(p0[1], p1[1], p2[1]), max(p0[2], p1[2], p2[2])
+    )
     return (mn, mx)
 
-def scene_primitive_triangle(v0: vec3, v1: vec3, v2: vec3, mat_id: int, n0=None, n1=None, n2=None, uv0=None, uv1=None, uv2=None) -> ScenePrimitive:
+
+def scene_primitive_triangle(
+    v0: vec3,
+    v1: vec3,
+    v2: vec3,
+    mat_id: int,
+    n0=None,
+    n1=None,
+    n2=None,
+    uv0=None,
+    uv1=None,
+    uv2=None,
+) -> ScenePrimitive:
     e1 = v1 - v0
     e2 = v2 - v0
     p0 = v0
@@ -514,9 +667,34 @@ def scene_primitive_triangle(v0: vec3, v1: vec3, v2: vec3, mat_id: int, n0=None,
     else:
         geo_n = vec3(0.0, 0.0, 1.0)
     aabb_min, aabb_max = _pad_degenerate_aabb(*_componentwise_min_max(p0, p1, p2))
-    return ScenePrimitive(kind=KIND_TRIANGLE, mat_id=mat_id, center0=v0, center_vel=e1, radius=0.0, box_min=e2, box_max=geo_n, bvh_min=aabb_min, bvh_max=aabb_max, sdf_kind=0, n0=n0 if n0 is not None else vec3(0.0), n1=n1 if n1 is not None else vec3(0.0), n2=n2 if n2 is not None else vec3(0.0), uv0=uv0 if uv0 is not None else vec3(0.0), uv1=uv1 if uv1 is not None else vec3(0.0), uv2=uv2 if uv2 is not None else vec3(0.0))
+    return ScenePrimitive(
+        kind=KIND_TRIANGLE,
+        mat_id=mat_id,
+        center0=v0,
+        center_vel=e1,
+        radius=0.0,
+        box_min=e2,
+        box_max=geo_n,
+        bvh_min=aabb_min,
+        bvh_max=aabb_max,
+        sdf_kind=0,
+        n0=n0 if n0 is not None else vec3(0.0),
+        n1=n1 if n1 is not None else vec3(0.0),
+        n2=n2 if n2 is not None else vec3(0.0),
+        uv0=uv0 if uv0 is not None else vec3(0.0),
+        uv1=uv1 if uv1 is not None else vec3(0.0),
+        uv2=uv2 if uv2 is not None else vec3(0.0),
+    )
 
-def scene_primitive_quad(Q: vec3, u: vec3, v: vec3, mat_id: int, invisible_primary: bool=False, one_way_inside: bool=False) -> ScenePrimitive:
+
+def scene_primitive_quad(
+    Q: vec3,
+    u: vec3,
+    v: vec3,
+    mat_id: int,
+    invisible_primary: bool = False,
+    one_way_inside: bool = False,
+) -> ScenePrimitive:
     p00 = Q
     p10 = Q + u
     p01 = Q + v
@@ -524,63 +702,178 @@ def scene_primitive_quad(Q: vec3, u: vec3, v: vec3, mat_id: int, invisible_prima
     xs = (p00[0], p10[0], p01[0], p11[0])
     ys = (p00[1], p10[1], p01[1], p11[1])
     zs = (p00[2], p10[2], p01[2], p11[2])
-    aabb_min, aabb_max = _pad_degenerate_aabb(vec3(min(xs), min(ys), min(zs)), vec3(max(xs), max(ys), max(zs)))
+    aabb_min, aabb_max = _pad_degenerate_aabb(
+        vec3(min(xs), min(ys), min(zs)), vec3(max(xs), max(ys), max(zs))
+    )
     cx = u[1] * v[2] - u[2] * v[1]
     cy = u[2] * v[0] - u[0] * v[2]
     cz = u[0] * v[1] - u[1] * v[0]
     ln = math.sqrt(cx * cx + cy * cy + cz * cz) + 1e-20
     n = vec3(cx / ln, cy / ln, cz / ln)
-    return ScenePrimitive(kind=KIND_QUAD, mat_id=mat_id, center0=Q, center_vel=u, radius=0.0, box_min=v, box_max=n, bvh_min=aabb_min, bvh_max=aabb_max, sdf_kind=(PRIM_FLAG_INVISIBLE_PRIMARY if invisible_primary else 0) | (PRIM_FLAG_ONE_WAY_INSIDE if one_way_inside else 0))
+    return ScenePrimitive(
+        kind=KIND_QUAD,
+        mat_id=mat_id,
+        center0=Q,
+        center_vel=u,
+        radius=0.0,
+        box_min=v,
+        box_max=n,
+        bvh_min=aabb_min,
+        bvh_max=aabb_max,
+        sdf_kind=(PRIM_FLAG_INVISIBLE_PRIMARY if invisible_primary else 0)
+        | (PRIM_FLAG_ONE_WAY_INSIDE if one_way_inside else 0),
+    )
+
 
 def scene_primitive_ellipsoid(center: vec3, radii: vec3, mat_id: int) -> ScenePrimitive:
     aabb_min = center - radii
     aabb_max = center + radii
-    return ScenePrimitive(kind=KIND_ELLIPSOID, mat_id=mat_id, center0=center, center_vel=vec3(0.0), radius=0.0, box_min=radii, box_max=vec3(0.0), bvh_min=aabb_min, bvh_max=aabb_max, sdf_kind=0)
+    return ScenePrimitive(
+        kind=KIND_ELLIPSOID,
+        mat_id=mat_id,
+        center0=center,
+        center_vel=vec3(0.0),
+        radius=0.0,
+        box_min=radii,
+        box_max=vec3(0.0),
+        bvh_min=aabb_min,
+        bvh_max=aabb_max,
+        sdf_kind=0,
+    )
 
-def scene_primitive_sdf_torus(center: vec3, major_r: float, minor_r: float, mat_id: int) -> ScenePrimitive:
+
+def scene_primitive_sdf_torus(
+    center: vec3, major_r: float, minor_r: float, mat_id: int
+) -> ScenePrimitive:
     ext = major_r + minor_r
     aabb_min = center - vec3(ext, minor_r, ext)
     aabb_max = center + vec3(ext, minor_r, ext)
-    return ScenePrimitive(kind=KIND_SDF, mat_id=mat_id, center0=center, center_vel=vec3(0.0), radius=0.0, box_min=vec3(major_r, minor_r, 0.0), box_max=vec3(0.0), bvh_min=aabb_min, bvh_max=aabb_max, sdf_kind=SDF_TORUS)
+    return ScenePrimitive(
+        kind=KIND_SDF,
+        mat_id=mat_id,
+        center0=center,
+        center_vel=vec3(0.0),
+        radius=0.0,
+        box_min=vec3(major_r, minor_r, 0.0),
+        box_max=vec3(0.0),
+        bvh_min=aabb_min,
+        bvh_max=aabb_max,
+        sdf_kind=SDF_TORUS,
+    )
 
-def scene_primitive_sdf_capsule(center: vec3, cap_radius: float, half_height: float, mat_id: int) -> ScenePrimitive:
+
+def scene_primitive_sdf_capsule(
+    center: vec3, cap_radius: float, half_height: float, mat_id: int
+) -> ScenePrimitive:
     aabb_min = center - vec3(cap_radius, half_height + cap_radius, cap_radius)
     aabb_max = center + vec3(cap_radius, half_height + cap_radius, cap_radius)
-    return ScenePrimitive(kind=KIND_SDF, mat_id=mat_id, center0=center, center_vel=vec3(0.0), radius=0.0, box_min=vec3(cap_radius, half_height, 0.0), box_max=vec3(0.0), bvh_min=aabb_min, bvh_max=aabb_max, sdf_kind=SDF_CAPSULE)
+    return ScenePrimitive(
+        kind=KIND_SDF,
+        mat_id=mat_id,
+        center0=center,
+        center_vel=vec3(0.0),
+        radius=0.0,
+        box_min=vec3(cap_radius, half_height, 0.0),
+        box_max=vec3(0.0),
+        bvh_min=aabb_min,
+        bvh_max=aabb_max,
+        sdf_kind=SDF_CAPSULE,
+    )
 
-def scene_primitive_sdf_rounded_box(center: vec3, half_extents: vec3, corner_r: float, mat_id: int) -> ScenePrimitive:
+
+def scene_primitive_sdf_rounded_box(
+    center: vec3, half_extents: vec3, corner_r: float, mat_id: int
+) -> ScenePrimitive:
     ext = half_extents + vec3(corner_r, corner_r, corner_r)
     aabb_min = center - ext
     aabb_max = center + ext
-    return ScenePrimitive(kind=KIND_SDF, mat_id=mat_id, center0=center, center_vel=vec3(0.0), radius=corner_r, box_min=half_extents, box_max=vec3(0.0), bvh_min=aabb_min, bvh_max=aabb_max, sdf_kind=SDF_ROUNDED_BOX)
+    return ScenePrimitive(
+        kind=KIND_SDF,
+        mat_id=mat_id,
+        center0=center,
+        center_vel=vec3(0.0),
+        radius=corner_r,
+        box_min=half_extents,
+        box_max=vec3(0.0),
+        bvh_min=aabb_min,
+        bvh_max=aabb_max,
+        sdf_kind=SDF_ROUNDED_BOX,
+    )
 
-def load_mesh_primitives(path: str, mat_id: int, scale: float=1.0, translate=(0.0, 0.0, 0.0), material_slots: int=1):
+
+def load_mesh_primitives(
+    path: str,
+    mat_id: int,
+    scale: float = 1.0,
+    translate=(0.0, 0.0, 0.0),
+    material_slots: int = 1,
+):
     from src.geometry.mesh_io import load_mesh_auto
+
     mesh = load_mesh_auto(path, scale=scale, translate=translate)
     slots = max(1, int(material_slots))
-    return [scene_primitive_triangle(tri.p0, tri.p1, tri.p2, mat_id + min(max(int(tri.material_id), 0), slots - 1), tri.n0, tri.n1, tri.n2, tri.uv0, tri.uv1, tri.uv2) for tri in mesh.triangles]
+    return [
+        scene_primitive_triangle(
+            tri.p0,
+            tri.p1,
+            tri.p2,
+            mat_id + min(max(int(tri.material_id), 0), slots - 1),
+            tri.n0,
+            tri.n1,
+            tri.n2,
+            tri.uv0,
+            tri.uv1,
+            tri.uv2,
+        )
+        for tri in mesh.triangles
+    ]
 
-def load_mesh_triangles(path: str, scale: float=1.0, translate=(0.0, 0.0, 0.0), material_slots: int=1, max_triangles: int | None=None, sort_by_material: bool=False, flip_winding: bool=False, expected_face_count: int | None=None):
+
+def load_mesh_triangles(
+    path: str,
+    scale: float = 1.0,
+    translate=(0.0, 0.0, 0.0),
+    material_slots: int = 1,
+    max_triangles: int | None = None,
+    sort_by_material: bool = False,
+    flip_winding: bool = False,
+    expected_face_count: int | None = None,
+):
     from dataclasses import replace
+
     from src.geometry.mesh_io import load_mesh_auto
-    mesh = load_mesh_auto(path, scale=scale, translate=translate, flip_winding=flip_winding)
+
+    mesh = load_mesh_auto(
+        path, scale=scale, translate=translate, flip_winding=flip_winding
+    )
     tris = list(mesh.triangles)
     if len(tris) != mesh.stats.valid_face_count:
-        raise RuntimeError(f'Mesh {path}: tri_count={len(tris)} != valid_face_count={mesh.stats.valid_face_count}')
+        raise RuntimeError(
+            f"Mesh {path}: tri_count={len(tris)} != valid_face_count={mesh.stats.valid_face_count}"
+        )
     if expected_face_count is not None and len(tris) != expected_face_count:
-        raise RuntimeError(f'Mesh {path}: loaded {len(tris)} triangles, expected {expected_face_count}')
+        raise RuntimeError(
+            f"Mesh {path}: loaded {len(tris)} triangles, expected {expected_face_count}"
+        )
     if max_triangles is not None and max_triangles > 0 and (len(tris) > max_triangles):
         step = max(1, len(tris) // int(max_triangles))
-        tris = tris[::step][:int(max_triangles)]
-        print(f'[mesh load] WARNING: subsampled {path} to {len(tris):,} triangles (max_triangles={max_triangles})', file=__import__('sys').stderr)
+        tris = tris[::step][: int(max_triangles)]
+        print(
+            f"[mesh load] WARNING: subsampled {path} to {len(tris):,} triangles (max_triangles={max_triangles})",
+            file=__import__("sys").stderr,
+        )
     slots = max(1, int(material_slots))
     if slots == 1:
         tris = [replace(tri, material_id=0) for tri in tris]
     else:
-        tris = [replace(tri, material_id=min(max(int(tri.material_id), 0), slots - 1)) for tri in tris]
+        tris = [
+            replace(tri, material_id=min(max(int(tri.material_id), 0), slots - 1))
+            for tri in tris
+        ]
     if sort_by_material:
         tris.sort(key=lambda tri: tri.material_id)
     return (mesh, tris)
+
 
 @ti.data_oriented
 class PrimBVH:
@@ -609,8 +902,19 @@ class PrimBVH:
         tri_idx = PrimBVH._triangle_index(ref)
         return ti.select(ref < 0, self.analytic_count + tri_idx, ref)
 
-    def __init__(self, primitives_field, prim_count: int, split: str='sah', host_primitives=None, host_triangles=None, triangle_mat_id: int=0, host_materials=None):
-        debug_tools.log(f'PrimBVH init start: analytic_field_count={prim_count}, split={split}')
+    def __init__(
+        self,
+        primitives_field,
+        prim_count: int,
+        split: str = "sah",
+        host_primitives=None,
+        host_triangles=None,
+        triangle_mat_id: int = 0,
+        host_materials=None,
+    ):
+        debug_tools.log(
+            f"PrimBVH init start: analytic_field_count={prim_count}, split={split}"
+        )
         init_t0 = debug_tools.now() if debug_tools.enabled() else 0.0
         self.primitives = primitives_field
         self.analytic_count = prim_count
@@ -621,51 +925,118 @@ class PrimBVH:
         self.has_ellipsoid = False
         self.has_sdf = False
         host_t0 = debug_tools.now() if debug_tools.enabled() else 0.0
-        host_prims = host_primitives if host_primitives is not None else [primitives_field[i] for i in range(prim_count)]
+        host_prims = (
+            host_primitives
+            if host_primitives is not None
+            else [primitives_field[i] for i in range(prim_count)]
+        )
         mesh_triangles = list(host_triangles) if host_triangles is not None else []
         if debug_tools.enabled():
-            debug_tools.log(f'host primitive inputs ready in {debug_tools.now() - host_t0:.3f}s: {len(host_prims):,} analytic candidates, {len(mesh_triangles):,} mesh triangles')
+            debug_tools.log(
+                f"host primitive inputs ready in {debug_tools.now() - host_t0:.3f}s: {len(host_prims):,} analytic candidates, {len(mesh_triangles):,} mesh triangles"
+            )
         analytic_prims = []
         triangle_specs = []
         classify_t0 = debug_tools.now() if debug_tools.enabled() else 0.0
         for p in host_prims:
             if int(p.kind) == KIND_TRIANGLE:
-                triangle_specs.append((p.center0, p.center0 + p.center_vel, p.center0 + p.box_min, p.mat_id, p.n0, p.n1, p.n2, p.uv0, p.uv1, p.uv2, p.bvh_min, p.bvh_max, p.box_max, int(p.sdf_kind & PRIM_FLAG_TWO_SIDED != 0)))
+                triangle_specs.append(
+                    (
+                        p.center0,
+                        p.center0 + p.center_vel,
+                        p.center0 + p.box_min,
+                        p.mat_id,
+                        p.n0,
+                        p.n1,
+                        p.n2,
+                        p.uv0,
+                        p.uv1,
+                        p.uv2,
+                        p.bvh_min,
+                        p.bvh_max,
+                        p.box_max,
+                        int(p.sdf_kind & PRIM_FLAG_TWO_SIDED != 0),
+                    )
+                )
             else:
                 analytic_prims.append(p)
         self.analytic_count = len(analytic_prims)
         for tri in mesh_triangles:
-            triangle_specs.append((tri.p0, tri.p1, tri.p2, triangle_mat_id + int(tri.material_id), tri.n0, tri.n1, tri.n2, tri.uv0, tri.uv1, tri.uv2, None, None, tri.geo_normal, 1))
+            triangle_specs.append(
+                (
+                    tri.p0,
+                    tri.p1,
+                    tri.p2,
+                    triangle_mat_id + int(tri.material_id),
+                    tri.n0,
+                    tri.n1,
+                    tri.n2,
+                    tri.uv0,
+                    tri.uv1,
+                    tri.uv2,
+                    None,
+                    None,
+                    tri.geo_normal,
+                    1,
+                )
+            )
         self.triangle_count = len(triangle_specs)
         self.has_triangle = self.triangle_count > 0
         if self.triangle_count > 0 and mesh_triangles:
             expected = len(mesh_triangles)
             if self.triangle_count != expected:
-                raise RuntimeError(f'Triangle upload count mismatch: tri_count={self.triangle_count}, expected={expected}')
-            print(f'[PrimBVH] Triangle SOA upload validated: {self.triangle_count:,} triangles', file=__import__('sys').stderr)
+                raise RuntimeError(
+                    f"Triangle upload count mismatch: tri_count={self.triangle_count}, expected={expected}"
+                )
+            print(
+                f"[PrimBVH] Triangle SOA upload validated: {self.triangle_count:,} triangles",
+                file=__import__("sys").stderr,
+            )
         if debug_tools.enabled():
-            debug_tools.log(f'classified primitives in {debug_tools.now() - classify_t0:.3f}s: {len(analytic_prims):,} analytic, {self.triangle_count:,} triangles')
+            debug_tools.log(
+                f"classified primitives in {debug_tools.now() - classify_t0:.3f}s: {len(analytic_prims):,} analytic, {self.triangle_count:,} triangles"
+            )
         tri_shape = max(self.triangle_count, 1)
-        self.tri_v0 = ti.Vector.field(3, dtype=ti.f32, shape=tri_shape, layout=ti.Layout.SOA)
-        self.tri_e1 = ti.Vector.field(3, dtype=ti.f32, shape=tri_shape, layout=ti.Layout.SOA)
-        self.tri_e2 = ti.Vector.field(3, dtype=ti.f32, shape=tri_shape, layout=ti.Layout.SOA)
-        self.tri_normal = ti.Vector.field(3, dtype=ti.f32, shape=tri_shape, layout=ti.Layout.SOA)
+        self.tri_v0 = ti.Vector.field(
+            3, dtype=ti.f32, shape=tri_shape, layout=ti.Layout.SOA
+        )
+        self.tri_e1 = ti.Vector.field(
+            3, dtype=ti.f32, shape=tri_shape, layout=ti.Layout.SOA
+        )
+        self.tri_e2 = ti.Vector.field(
+            3, dtype=ti.f32, shape=tri_shape, layout=ti.Layout.SOA
+        )
+        self.tri_normal = ti.Vector.field(
+            3, dtype=ti.f32, shape=tri_shape, layout=ti.Layout.SOA
+        )
         self.tri_plane_d = ti.field(dtype=ti.f32, shape=tri_shape)
-        self.tri_n0 = ti.Vector.field(3, dtype=ti.f32, shape=tri_shape, layout=ti.Layout.SOA)
-        self.tri_n1 = ti.Vector.field(3, dtype=ti.f32, shape=tri_shape, layout=ti.Layout.SOA)
-        self.tri_n2 = ti.Vector.field(3, dtype=ti.f32, shape=tri_shape, layout=ti.Layout.SOA)
-        self.tri_uv0 = ti.Vector.field(3, dtype=ti.f32, shape=tri_shape, layout=ti.Layout.SOA)
-        self.tri_uv1 = ti.Vector.field(3, dtype=ti.f32, shape=tri_shape, layout=ti.Layout.SOA)
-        self.tri_uv2 = ti.Vector.field(3, dtype=ti.f32, shape=tri_shape, layout=ti.Layout.SOA)
+        self.tri_n0 = ti.Vector.field(
+            3, dtype=ti.f32, shape=tri_shape, layout=ti.Layout.SOA
+        )
+        self.tri_n1 = ti.Vector.field(
+            3, dtype=ti.f32, shape=tri_shape, layout=ti.Layout.SOA
+        )
+        self.tri_n2 = ti.Vector.field(
+            3, dtype=ti.f32, shape=tri_shape, layout=ti.Layout.SOA
+        )
+        self.tri_uv0 = ti.Vector.field(
+            3, dtype=ti.f32, shape=tri_shape, layout=ti.Layout.SOA
+        )
+        self.tri_uv1 = ti.Vector.field(
+            3, dtype=ti.f32, shape=tri_shape, layout=ti.Layout.SOA
+        )
+        self.tri_uv2 = ti.Vector.field(
+            3, dtype=ti.f32, shape=tri_shape, layout=ti.Layout.SOA
+        )
         self.tri_mat_id = ti.field(dtype=ti.i32, shape=tri_shape)
         self.tri_two_sided = ti.field(dtype=ti.i32, shape=tri_shape)
         mat_two_sided: dict[int, int] = {}
         if host_materials is not None:
             for mid, mat in enumerate(host_materials):
-                mat_two_sided[mid] = int(getattr(mat, 'two_sided', 0))
+                mat_two_sided[mid] = int(getattr(mat, "two_sided", 0))
         prim_data = []
-        scene_min = [float('inf'), float('inf'), float('inf')]
-        scene_max = [float('-inf'), float('-inf'), float('-inf')]
+        scene_min = [float("inf"), float("inf"), float("inf")]
+        scene_max = [float("-inf"), float("-inf"), float("-inf")]
         for i, p in enumerate(analytic_prims):
             kind = int(p.kind)
             self.has_sphere = self.has_sphere or kind == KIND_SPHERE
@@ -673,12 +1044,9 @@ class PrimBVH:
             self.has_quad = self.has_quad or kind == KIND_QUAD
             self.has_ellipsoid = self.has_ellipsoid or kind == KIND_ELLIPSOID
             self.has_sdf = self.has_sdf or kind == KIND_SDF
-            mn = vec3(p.bvh_min[0], p.bvh_min[1], p.bvh_min[2])
-            mx = vec3(p.bvh_max[0], p.bvh_max[1], p.bvh_max[2])
-            prim_data.append((mn, mx, i))
             for axis in range(3):
-                scene_min[axis] = min(scene_min[axis], float(mn[axis]))
-                scene_max[axis] = max(scene_max[axis], float(mx[axis]))
+                scene_min[axis] = min(scene_min[axis], float(p.bvh_min[axis]))
+                scene_max[axis] = max(scene_max[axis], float(p.bvh_max[axis]))
         if self.triangle_count > 0:
             tri_upload_t0 = debug_tools.now() if debug_tools.enabled() else 0.0
             n_tri = self.triangle_count
@@ -724,7 +1092,11 @@ class PrimBVH:
                 tri_uv1[i] = (float(uv1_s[0]), float(uv1_s[1]), float(uv1_s[2]))
                 tri_uv2[i] = (float(uv2_s[0]), float(uv2_s[1]), float(uv2_s[2]))
                 tri_mat[i] = int(mat_id)
-                tri_two_sided[i] = int(spec[13]) if len(spec) > 13 else mat_two_sided.get(int(mat_id), 0)
+                tri_two_sided[i] = (
+                    int(spec[13])
+                    if len(spec) > 13
+                    else mat_two_sided.get(int(mat_id), 0)
+                )
                 if len(spec) > 12 and spec[12] is not None:
                     gn = spec[12]
                     tri_normal[i, 0] = float(gn[0])
@@ -742,7 +1114,9 @@ class PrimBVH:
             normal_err = np.sum(tri_normal * computed_normal, axis=1)
             bad = (cross_len[:, 0] > 1e-20) & (normal_err < np.cos(np.radians(5.0)))
             if np.any(bad):
-                raise RuntimeError(f'Triangle normal validation failed for {int(np.sum(bad))} triangles (stored normal deviates >1° from cross(e1,e2) with {normal_err})')
+                raise RuntimeError(
+                    f"Triangle normal validation failed for {int(np.sum(bad))} triangles (stored normal deviates >1° from cross(e1,e2) with {normal_err})"
+                )
             all_mins = np.minimum(np.minimum(all_p0, all_p1), all_p2)
             all_maxs = np.maximum(np.maximum(all_p0, all_p1), all_p2)
             for axis in range(3):
@@ -755,10 +1129,6 @@ class PrimBVH:
                 if bmn is not None and bmx is not None:
                     all_mins[i] = (float(bmn[0]), float(bmn[1]), float(bmn[2]))
                     all_maxs[i] = (float(bmx[0]), float(bmx[1]), float(bmx[2]))
-            for i in range(n_tri):
-                mn = vec3(float(all_mins[i, 0]), float(all_mins[i, 1]), float(all_mins[i, 2]))
-                mx = vec3(float(all_maxs[i, 0]), float(all_maxs[i, 1]), float(all_maxs[i, 2]))
-                prim_data.append((mn, mx, PrimBVH.triangle_ref(i)))
             global_tri_min = all_mins.min(axis=0)
             global_tri_max = all_maxs.max(axis=0)
             for axis in range(3):
@@ -778,100 +1148,238 @@ class PrimBVH:
             self.tri_mat_id.from_numpy(tri_mat)
             self.tri_two_sided.from_numpy(tri_two_sided)
             if debug_tools.enabled():
-                debug_tools.log(f'triangle SOA arrays built/uploaded in {debug_tools.now() - tri_upload_t0:.3f}s ({self.triangle_count:,} triangles)')
-        self.bvh_prim_count = len(prim_data)
+                debug_tools.log(
+                    f"triangle SOA arrays built/uploaded in {debug_tools.now() - tri_upload_t0:.3f}s ({self.triangle_count:,} triangles)"
+                )
+        self.bvh_prim_count = len(analytic_prims) + self.triangle_count
         if self.bvh_prim_count == 0:
             scene_min = [0.0, 0.0, 0.0]
             scene_max = [0.0, 0.0, 0.0]
         prim_mins = np.zeros((max(self.bvh_prim_count, 1), 3), dtype=np.float32)
         prim_maxs = np.zeros((max(self.bvh_prim_count, 1), 3), dtype=np.float32)
         prim_refs = np.zeros((max(self.bvh_prim_count, 1),), dtype=np.int32)
-        storage_mins = np.zeros((max(len(analytic_prims) + self.triangle_count, 1), 3), dtype=np.float32)
-        storage_maxs = np.zeros((max(len(analytic_prims) + self.triangle_count, 1), 3), dtype=np.float32)
-        for i, (mn, mx, ref) in enumerate(prim_data):
-            prim_mins[i] = (float(mn[0]), float(mn[1]), float(mn[2]))
-            prim_maxs[i] = (float(mx[0]), float(mx[1]), float(mx[2]))
-            prim_refs[i] = int(ref)
+        
+        for i, p in enumerate(analytic_prims):
+            prim_mins[i] = (float(p.bvh_min[0]), float(p.bvh_min[1]), float(p.bvh_min[2]))
+            prim_maxs[i] = (float(p.bvh_max[0]), float(p.bvh_max[1]), float(p.bvh_max[2]))
+            prim_refs[i] = i
+        
+        if self.triangle_count > 0:
+            ofst = len(analytic_prims)
+            prim_mins[ofst:ofst + self.triangle_count] = all_mins
+            prim_maxs[ofst:ofst + self.triangle_count] = all_maxs
+            prim_refs[ofst:ofst + self.triangle_count] = -np.arange(self.triangle_count, dtype=np.int32) - 1
+
+        storage_mins = np.zeros(
+            (max(len(analytic_prims) + self.triangle_count, 1), 3), dtype=np.float32
+        )
+        storage_maxs = np.zeros(
+            (max(len(analytic_prims) + self.triangle_count, 1), 3), dtype=np.float32
+        )
+        for i in range(self.bvh_prim_count):
+            ref = prim_refs[i]
             storage_slot = int(ref) if int(ref) >= 0 else len(analytic_prims) + (-int(ref) - 1)
             storage_mins[storage_slot] = prim_mins[i]
             storage_maxs[storage_slot] = prim_maxs[i]
-        self.prim_bvh_min = ti.Vector.field(3, dtype=ti.f32, shape=max(self.bvh_prim_count, 1), layout=ti.Layout.SOA)
-        self.prim_bvh_max = ti.Vector.field(3, dtype=ti.f32, shape=max(self.bvh_prim_count, 1), layout=ti.Layout.SOA)
+        self.prim_bvh_min = ti.Vector.field(
+            3, dtype=ti.f32, shape=max(self.bvh_prim_count, 1), layout=ti.Layout.SOA
+        )
+        self.prim_bvh_max = ti.Vector.field(
+            3, dtype=ti.f32, shape=max(self.bvh_prim_count, 1), layout=ti.Layout.SOA
+        )
         self.prim_refs = ti.field(dtype=ti.i32, shape=max(self.bvh_prim_count, 1))
-        self.storage_bvh_min = ti.Vector.field(3, dtype=ti.f32, shape=max(len(analytic_prims) + self.triangle_count, 1), layout=ti.Layout.SOA)
-        self.storage_bvh_max = ti.Vector.field(3, dtype=ti.f32, shape=max(len(analytic_prims) + self.triangle_count, 1), layout=ti.Layout.SOA)
+        self.storage_bvh_min = ti.Vector.field(
+            3,
+            dtype=ti.f32,
+            shape=max(len(analytic_prims) + self.triangle_count, 1),
+            layout=ti.Layout.SOA,
+        )
+        self.storage_bvh_max = ti.Vector.field(
+            3,
+            dtype=ti.f32,
+            shape=max(len(analytic_prims) + self.triangle_count, 1),
+            layout=ti.Layout.SOA,
+        )
         self.prim_bvh_min.from_numpy(prim_mins)
         self.prim_bvh_max.from_numpy(prim_maxs)
         self.prim_refs.from_numpy(prim_refs)
         self.storage_bvh_min.from_numpy(storage_mins)
         self.storage_bvh_max.from_numpy(storage_maxs)
         if debug_tools.enabled():
-            debug_tools.log(f'BVH bounds uploaded: bvh_prims={self.bvh_prim_count:,}, storage_slots={len(analytic_prims) + self.triangle_count:,}')
-        self.indices_are_bvh_indices = split == 'gpu'
-        if split == 'gpu':
+            debug_tools.log(
+                f"BVH bounds uploaded: bvh_prims={self.bvh_prim_count:,}, storage_slots={len(analytic_prims) + self.triangle_count:,}"
+            )
+        if split in ["sah", "binned_sah", "cpu", "spatial"]:
+            split = "gpu_sah"
+
+        self.indices_are_bvh_indices = split == "gpu"
+        if split == "gpu":
             gpu_bvh_t0 = debug_tools.now() if debug_tools.enabled() else 0.0
-            leaf_count = max(1, (self.bvh_prim_count + self.GPU_LEAF_SIZE - 1) // self.GPU_LEAF_SIZE)
+            leaf_count = max(
+                1, (self.bvh_prim_count + self.GPU_LEAF_SIZE - 1) // self.GPU_LEAF_SIZE
+            )
             base = 1
             while base < leaf_count:
                 base *= 2
             self.node_count = max(1, 2 * base - 1)
-            self.nodes = BVHNode.field(shape=(self.node_count + 1,), layout=ti.Layout.SOA)
-            self.prim_indices = ti.field(dtype=ti.i32, shape=(max(self.bvh_prim_count, 1),))
+            self.nodes = BVHNode.field(
+                shape=(self.node_count + 1,), layout=ti.Layout.SOA
+            )
+            self.prim_indices = ti.field(
+                dtype=ti.i32, shape=(max(self.bvh_prim_count, 1),)
+            )
             self.prim_count = self.bvh_prim_count
-            self._build_gpu_morton_bvh(self.bvh_prim_count, base, vec3(scene_min[0], scene_min[1], scene_min[2]), vec3(1.0 / max(scene_max[0] - scene_min[0], 1e-10), 1.0 / max(scene_max[1] - scene_min[1], 1e-10), 1.0 / max(scene_max[2] - scene_min[2], 1e-10)))
+            self._build_gpu_morton_bvh(
+                self.bvh_prim_count,
+                base,
+                vec3(scene_min[0], scene_min[1], scene_min[2]),
+                vec3(
+                    1.0 / max(scene_max[0] - scene_min[0], 1e-10),
+                    1.0 / max(scene_max[1] - scene_min[1], 1e-10),
+                    1.0 / max(scene_max[2] - scene_min[2], 1e-10),
+                ),
+            )
             if debug_tools.enabled():
-                debug_tools.log(f'PrimBVH GPU Morton build complete in {debug_tools.now() - gpu_bvh_t0:.3f}s: nodes={self.node_count:,}, prim_indices={self.prim_count:,}')
-                debug_tools.log(f'PrimBVH init end ({debug_tools.now() - init_t0:.3f}s)')
+                debug_tools.log(
+                    f"PrimBVH GPU Morton build complete in {debug_tools.now() - gpu_bvh_t0:.3f}s: nodes={self.node_count:,}, prim_indices={self.prim_count:,}"
+                )
+                debug_tools.log(
+                    f"PrimBVH init end ({debug_tools.now() - init_t0:.3f}s)"
+                )
             return
+        elif split == "gpu_sah":
+            from time import perf_counter as _pf
+            gpu_sah_t0 = _pf()
+            if debug_tools.enabled():
+                debug_tools.log("PrimBVH gpu_sah: starting Karras LBVH build")
+
+            builder = GPUSAHBVHBuilder(prim_mins, prim_maxs, prim_refs, leaf_size=2)
+            builder.build()
+            gpu_sah_build_t = _pf() - gpu_sah_t0
+
+            max_idx = max(builder.max_heap_idx, 1)
+            self.node_count = max_idx
+            n_prims = len(builder.ordered_prim_indices)
+            self.prim_count = n_prims
+            self.indices_are_bvh_indices = False
+
+            upload_t0 = _pf()
+            import numpy as _np
+            node_shape = max_idx + 1
+            self.nodes = BVHNode.field(shape=(node_shape,), layout=ti.Layout.SOA)
+            h_mn = builder.heap_aabb_min
+            h_mx = builder.heap_aabb_max
+            h_lf = builder.heap_left_or_first
+            h_c = builder.heap_count
+            pad = node_shape - h_mn.shape[0]
+            if pad > 0:
+                h_mn = _np.pad(h_mn, ((0, pad), (0, 0)), constant_values=0.0)
+                h_mx = _np.pad(h_mx, ((0, pad), (0, 0)), constant_values=0.0)
+                h_lf = _np.pad(h_lf, (0, pad), constant_values=0)
+                h_c = _np.pad(h_c, (0, pad), constant_values=0)
+            self.nodes.aabb_min.from_numpy(h_mn[:node_shape])
+            self.nodes.aabb_max.from_numpy(h_mx[:node_shape])
+            self.nodes.left_or_first.from_numpy(h_lf[:node_shape])
+            self.nodes.count.from_numpy(h_c[:node_shape])
+            self.nodes.prim_count.from_numpy(h_c[:node_shape])
+
+            self.prim_indices = ti.field(dtype=ti.i32, shape=(max(n_prims, 1),))
+            prim_idx_np = _np.asarray(builder.ordered_prim_indices, dtype=_np.int32)
+            self.prim_indices.from_numpy(prim_idx_np)
+
+            upload_t = _pf() - upload_t0
+            gpu_sah_total = _pf() - gpu_sah_t0
+            print(
+                f"[PrimBVH] Karras gpu_sah: {gpu_sah_build_t:.3f}s build + "
+                f"{upload_t:.3f}s upload = {gpu_sah_total:.3f}s total "
+                f"({self.bvh_prim_count:,} prims, {self.node_count:,} nodes, {self.prim_count:,} ordered)",
+                flush=True,
+            )
+            if debug_tools.enabled():
+                debug_tools.log(
+                    f"PrimBVH GPU SAH build complete in {gpu_sah_total:.3f}s: "
+                    f"nodes={self.node_count:,}, prim_indices={self.prim_count:,}"
+                )
+                debug_tools.log(f"PrimBVH init end ({_pf() - gpu_sah_t0:.3f}s)")
+            return
+
         else:
             cpu_bvh_t0 = debug_tools.now() if debug_tools.enabled() else 0.0
-            builder = BVHBuilder(prim_data, layout='prim', split=split)
-        builder.build()
-        if debug_tools.enabled():
-            debug_tools.log(f'PrimBVH CPU {split} builder complete in {debug_tools.now() - cpu_bvh_t0:.3f}s: ordered={len(builder.ordered_prim_indices):,}')
-        max_idx = max(builder.get_max_index(), 1)
-        self.nodes = BVHNode.field(shape=(max_idx + 1,), layout=ti.Layout.SOA)
-        self.node_count = max_idx
-        n_prims = len(builder.ordered_prim_indices)
-        self.prim_indices = ti.field(dtype=ti.i32, shape=(max(n_prims, 1),))
-        self.prim_count = n_prims
-        for i in range(1, max_idx + 1):
-            node = builder.nodes[i]
-            if node is not None:
-                self.nodes[i].aabb_min = vec3(float(node.aabb_min[0]), float(node.aabb_min[1]), float(node.aabb_min[2]))
-                self.nodes[i].aabb_max = vec3(float(node.aabb_max[0]), float(node.aabb_max[1]), float(node.aabb_max[2]))
-                self.nodes[i].is_leaf = 1 if node.is_leaf else 0
-                self.nodes[i].first_prim = int(node.first_prim)
-                self.nodes[i].prim_count = int(node.prim_count)
-            else:
-                self.nodes[i].aabb_min = vec3(0, 0, 0)
-                self.nodes[i].aabb_max = vec3(0, 0, 0)
-                self.nodes[i].is_leaf = 0
-                self.nodes[i].first_prim = 0
-                self.nodes[i].prim_count = 0
-        for i, idx in enumerate(builder.ordered_prim_indices):
-            self.prim_indices[i] = idx
-        self.nodes[1].aabb_min = vec3(scene_min[0], scene_min[1], scene_min[2])
-        self.nodes[1].aabb_max = vec3(scene_max[0], scene_max[1], scene_max[2])
-        if debug_tools.enabled():
-            debug_tools.log(f'PrimBVH CPU fields uploaded: nodes={self.node_count:,}, prim_indices={self.prim_count:,}')
-            debug_tools.log(f'PrimBVH init end ({debug_tools.now() - init_t0:.3f}s)')
+            builder = BVHBuilder(prim_data, layout="prim", split=split)
+            builder.build()
+            if debug_tools.enabled():
+                debug_tools.log(
+                    f"PrimBVH CPU {split} builder complete in {debug_tools.now() - cpu_bvh_t0:.3f}s: ordered={len(builder.ordered_prim_indices):,}"
+                )
+            max_idx = max(builder.get_max_index(), 1)
+            self.nodes = BVHNode.field(shape=(max_idx + 1,), layout=ti.Layout.SOA)
+            self.node_count = max_idx
+            n_prims = len(builder.ordered_prim_indices)
+            self.prim_indices = ti.field(dtype=ti.i32, shape=(max(n_prims, 1),))
+            self.prim_count = n_prims
+            for i in range(1, max_idx + 1):
+                node = builder.nodes[i]
+                if node is not None:
+                    self.nodes[i].aabb_min = vec3(
+                        float(node.aabb_min[0]),
+                        float(node.aabb_min[1]),
+                        float(node.aabb_min[2]),
+                    )
+                    self.nodes[i].aabb_max = vec3(
+                        float(node.aabb_max[0]),
+                        float(node.aabb_max[1]),
+                        float(node.aabb_max[2]),
+                    )
+                    if node.is_leaf:
+                        self.nodes[i].left_or_first = int(node.first_prim)
+                        self.nodes[i].count = int(node.prim_count)
+                        self.nodes[i].prim_count = int(node.prim_count)
+                    else:
+                        self.nodes[i].left_or_first = 2 * i
+                        self.nodes[i].count = 0
+                        self.nodes[i].prim_count = 0
+                else:
+                    self.nodes[i].aabb_min = vec3(0, 0, 0)
+                    self.nodes[i].aabb_max = vec3(0, 0, 0)
+                    self.nodes[i].left_or_first = 0
+                    self.nodes[i].count = 0
+                    self.nodes[i].prim_count = 0
+            for i, idx in enumerate(builder.ordered_prim_indices):
+                self.prim_indices[i] = idx
+            self.nodes[1].aabb_min = vec3(scene_min[0], scene_min[1], scene_min[2])
+            self.nodes[1].aabb_max = vec3(scene_max[0], scene_max[1], scene_max[2])
+            if debug_tools.enabled():
+                debug_tools.log(
+                    f"PrimBVH CPU fields uploaded: nodes={self.node_count:,}, prim_indices={self.prim_count:,}"
+                )
+                debug_tools.log(f"PrimBVH init end ({debug_tools.now() - init_t0:.3f}s)")
 
     def resident_memory_estimate_bytes(self) -> int:
-        node_bytes = int(self.node_count + 1) * (6 * 4 + 3 * 4)
+        node_bytes = int(self.node_count + 1) * (6 * 4 + 4 * 4)
         prim_index_bytes = max(int(self.prim_count), 1) * 4
         bvh_bounds_bytes = max(int(self.bvh_prim_count), 1) * (2 * 3 * 4 + 4)
-        storage_bounds_bytes = max(int(self.analytic_count + self.triangle_count), 1) * (2 * 3 * 4)
+        storage_bounds_bytes = max(
+            int(self.analytic_count + self.triangle_count), 1
+        ) * (2 * 3 * 4)
         triangle_soa_bytes = max(int(self.triangle_count), 1) * (11 * 3 * 4 + 4)
         analytic_soa_bytes = max(int(self.analytic_count), 1) * (12 * 3 * 4 + 4 * 4)
-        return node_bytes + prim_index_bytes + bvh_bounds_bytes + storage_bounds_bytes + triangle_soa_bytes + analytic_soa_bytes
+        return (
+            node_bytes
+            + prim_index_bytes
+            + bvh_bounds_bytes
+            + storage_bounds_bytes
+            + triangle_soa_bytes
+            + analytic_soa_bytes
+        )
 
     def memory_summary(self) -> str:
         mb = self.resident_memory_estimate_bytes() / (1024.0 * 1024.0)
-        return f'analytic={self.analytic_count:,}, triangles={self.triangle_count:,}, bvh_prims={self.bvh_prim_count:,}, nodes={self.node_count:,}, resident_est={mb:.2f} MiB'
+        return f"analytic={self.analytic_count:,}, triangles={self.triangle_count:,}, bvh_prims={self.bvh_prim_count:,}, nodes={self.node_count:,}, resident_est={mb:.2f} MiB"
 
     @ti.func
-    def _primitive_hit_enabled(self, p: ScenePrimitive, r: Ray, ray_t: Interval, rec, xi: ti.i32, yi: ti.i32) -> ti.u8:
+    def _primitive_hit_enabled(
+        self, p: ScenePrimitive, r: Ray, ray_t: Interval, rec, xi: ti.i32, yi: ti.i32
+    ) -> ti.u8:
         ret = ti.cast(0, ti.u8)
         skip_primary = (p.sdf_kind & PRIM_FLAG_INVISIBLE_PRIMARY != 0) & (r.kind == 0)
         skip_one_way = _skip_one_way_inside(p, r) != 0
@@ -897,7 +1405,9 @@ class PrimBVH:
         return ret
 
     @ti.func
-    def _primitive_any_hit_enabled(self, p: ScenePrimitive, r: Ray, ray_t: Interval) -> ti.i32:
+    def _primitive_any_hit_enabled(
+        self, p: ScenePrimitive, r: Ray, ray_t: Interval
+    ) -> ti.i32:
         ret = 0
         if _skip_one_way_inside(p, r) == 0:
             if ti.static(self.has_sphere):
@@ -933,13 +1443,26 @@ class PrimBVH:
     @staticmethod
     @ti.func
     def _morton3d_gpu(x: ti.f32, y: ti.f32, z: ti.f32) -> ti.u32:
-        xx = PrimBVH._expand_bits_gpu(ti.cast(ti.math.clamp(x, 0.0, 1.0) * 1023.0, ti.u32))
-        yy = PrimBVH._expand_bits_gpu(ti.cast(ti.math.clamp(y, 0.0, 1.0) * 1023.0, ti.u32))
-        zz = PrimBVH._expand_bits_gpu(ti.cast(ti.math.clamp(z, 0.0, 1.0) * 1023.0, ti.u32))
+        xx = PrimBVH._expand_bits_gpu(
+            ti.cast(ti.math.clamp(x, 0.0, 1.0) * 1023.0, ti.u32)
+        )
+        yy = PrimBVH._expand_bits_gpu(
+            ti.cast(ti.math.clamp(y, 0.0, 1.0) * 1023.0, ti.u32)
+        )
+        zz = PrimBVH._expand_bits_gpu(
+            ti.cast(ti.math.clamp(z, 0.0, 1.0) * 1023.0, ti.u32)
+        )
         return xx << ti.u32(2) | yy << ti.u32(1) | zz
 
     @ti.kernel
-    def _compute_gpu_morton(self, codes: ti.template(), values: ti.template(), sort_count: ti.i32, scene_min: vec3, inv_extent: vec3):
+    def _compute_gpu_morton(
+        self,
+        codes: ti.template(),
+        values: ti.template(),
+        sort_count: ti.i32,
+        scene_min: vec3,
+        inv_extent: vec3,
+    ):
         for i in range(sort_count):
             if i < self.prim_count:
                 c = (self.prim_bvh_min[i] + self.prim_bvh_max[i]) * 0.5
@@ -951,7 +1474,14 @@ class PrimBVH:
                 values[i] = i
 
     @ti.kernel
-    def _bitonic_sort_step(self, codes: ti.template(), values: ti.template(), sort_count: ti.i32, j: ti.i32, k: ti.i32):
+    def _bitonic_sort_step(
+        self,
+        codes: ti.template(),
+        values: ti.template(),
+        sort_count: ti.i32,
+        j: ti.i32,
+        k: ti.i32,
+    ):
         for i in range(sort_count):
             ixj = i ^ j
             if ixj > i:
@@ -981,34 +1511,48 @@ class PrimBVH:
             start = leaf * ti.static(self.GPU_LEAF_SIZE)
             remain = self.prim_count - start
             count = ti.max(0, ti.min(ti.static(self.GPU_LEAF_SIZE), remain))
-            mn = vec3(1e+30, 1e+30, 1e+30)
-            mx = vec3(-1e+30, -1e+30, -1e+30)
+            mn = vec3(1e30, 1e30, 1e30)
+            mx = vec3(-1e30, -1e30, -1e30)
             for k in ti.static(range(self.GPU_LEAF_SIZE)):
                 if k < count:
                     bvh_idx = self.prim_indices[start + k]
                     mn = tm.min(mn, self.prim_bvh_min[bvh_idx])
                     mx = tm.max(mx, self.prim_bvh_max[bvh_idx])
-            self.nodes[node_idx] = BVHNode(aabb_min=mn, aabb_max=mx, is_leaf=1, first_prim=start, prim_count=count)
+            self.nodes[node_idx].aabb_min = mn
+            self.nodes[node_idx].aabb_max = mx
+            self.nodes[node_idx].left_or_first = start
+            self.nodes[node_idx].count = count
+            self.nodes[node_idx].prim_count = count
 
     @ti.kernel
     def _refit_gpu_level(self, start: ti.i32, end: ti.i32):
         for idx in range(start, end):
             left = self.nodes[idx * 2]
             right = self.nodes[idx * 2 + 1]
-            self.nodes[idx] = BVHNode(aabb_min=tm.min(left.aabb_min, right.aabb_min), aabb_max=tm.max(left.aabb_max, right.aabb_max), is_leaf=0, first_prim=0, prim_count=0)
+            self.nodes[idx].aabb_min = tm.min(left.aabb_min, right.aabb_min)
+            self.nodes[idx].aabb_max = tm.max(left.aabb_max, right.aabb_max)
+            self.nodes[idx].left_or_first = idx * 2
+            self.nodes[idx].count = 0
+            self.nodes[idx].prim_count = 0
 
-    def _build_gpu_morton_bvh(self, prim_count: int, base: int, scene_min: vec3, inv_extent: vec3) -> None:
+    def _build_gpu_morton_bvh(
+        self, prim_count: int, base: int, scene_min: vec3, inv_extent: vec3
+    ) -> None:
         sort_count = 1
         while sort_count < max(prim_count, 1):
             sort_count *= 2
-        debug_tools.log(f'GPU Morton BVH setup: prim_count={prim_count:,}, sort_count={sort_count:,}, leaf_base={base:,}')
+        debug_tools.log(
+            f"GPU Morton BVH setup: prim_count={prim_count:,}, sort_count={sort_count:,}, leaf_base={base:,}"
+        )
         codes = ti.field(dtype=ti.u32, shape=sort_count)
         values = ti.field(dtype=ti.i32, shape=sort_count)
         t0 = debug_tools.now() if debug_tools.enabled() else 0.0
         self._compute_gpu_morton(codes, values, sort_count, scene_min, inv_extent)
         if debug_tools.enabled():
             ti.sync()
-            debug_tools.log(f'GPU Morton codes computed in {debug_tools.now() - t0:.3f}s')
+            debug_tools.log(
+                f"GPU Morton codes computed in {debug_tools.now() - t0:.3f}s"
+            )
         k = 2
         sort_t0 = debug_tools.now() if debug_tools.enabled() else 0.0
         sort_passes = 0
@@ -1021,17 +1565,21 @@ class PrimBVH:
             k *= 2
         if debug_tools.enabled():
             ti.sync()
-            debug_tools.log(f'GPU bitonic sort finished in {debug_tools.now() - sort_t0:.3f}s ({sort_passes:,} kernel launches)')
+            debug_tools.log(
+                f"GPU bitonic sort finished in {debug_tools.now() - sort_t0:.3f}s ({sort_passes:,} kernel launches)"
+            )
         copy_t0 = debug_tools.now() if debug_tools.enabled() else 0.0
         self._copy_sorted_prim_indices(values)
         if debug_tools.enabled():
             ti.sync()
-            debug_tools.log(f'GPU sorted indices copied in {debug_tools.now() - copy_t0:.3f}s')
+            debug_tools.log(
+                f"GPU sorted indices copied in {debug_tools.now() - copy_t0:.3f}s"
+            )
         leaves_t0 = debug_tools.now() if debug_tools.enabled() else 0.0
         self._build_gpu_leaves(base)
         if debug_tools.enabled():
             ti.sync()
-            debug_tools.log(f'GPU leaves built in {debug_tools.now() - leaves_t0:.3f}s')
+            debug_tools.log(f"GPU leaves built in {debug_tools.now() - leaves_t0:.3f}s")
         level_start = base // 2
         level_end = base
         refit_t0 = debug_tools.now() if debug_tools.enabled() else 0.0
@@ -1043,17 +1591,32 @@ class PrimBVH:
             level_start //= 2
         ti.sync()
         if debug_tools.enabled():
-            debug_tools.log(f'GPU refit complete in {debug_tools.now() - refit_t0:.3f}s ({refit_levels:,} levels)')
+            debug_tools.log(
+                f"GPU refit complete in {debug_tools.now() - refit_t0:.3f}s ({refit_levels:,} levels)"
+            )
 
     @ti.func
-    def _hit_triangle_soa(self, prim_idx: ti.i32, r: Ray, ray_t: Interval, rec, xi: ti.i32, yi: ti.i32) -> ti.u8:
+    def _hit_triangle_soa(
+        self, prim_idx: ti.i32, r: Ray, ray_t: Interval, rec, xi: ti.i32, yi: ti.i32
+    ) -> ti.u8:
         v0 = self.tri_v0[prim_idx]
         e1 = self.tri_e1[prim_idx]
         e2 = self.tri_e2[prim_idx]
         geom_n = self.tri_normal[prim_idx]
         plane_d = self.tri_plane_d[prim_idx]
         two_sided = self.tri_two_sided[prim_idx]
-        hit_ok, root, uu, vv = _mt_triangle_intersect(v0, e1, e2, geom_n, plane_d, r.origin, r.direction, ray_t.min, ray_t.max, two_sided)
+        hit_ok, root, uu, vv = _mt_triangle_intersect(
+            v0,
+            e1,
+            e2,
+            geom_n,
+            plane_d,
+            r.origin,
+            r.direction,
+            ray_t.min,
+            ray_t.max,
+            two_sided,
+        )
         valid = hit_ok != 0
         if valid:
             rec[xi, yi].t = root
@@ -1094,8 +1657,21 @@ class PrimBVH:
         return ti.select(valid, ti.cast(1, ti.u8), ti.cast(0, ti.u8))
 
     @ti.func
-    def _occludes_triangle_soa(self, prim_idx: ti.i32, r: Ray, ray_t: Interval) -> ti.i32:
-        hit_ok, _, _, _ = _mt_triangle_intersect(self.tri_v0[prim_idx], self.tri_e1[prim_idx], self.tri_e2[prim_idx], self.tri_normal[prim_idx], self.tri_plane_d[prim_idx], r.origin, r.direction, ray_t.min, ray_t.max, self.tri_two_sided[prim_idx])
+    def _occludes_triangle_soa(
+        self, prim_idx: ti.i32, r: Ray, ray_t: Interval
+    ) -> ti.i32:
+        hit_ok, _, _, _ = _mt_triangle_intersect(
+            self.tri_v0[prim_idx],
+            self.tri_e1[prim_idx],
+            self.tri_e2[prim_idx],
+            self.tri_normal[prim_idx],
+            self.tri_plane_d[prim_idx],
+            r.origin,
+            r.direction,
+            ray_t.min,
+            ray_t.max,
+            self.tri_two_sided[prim_idx],
+        )
         return hit_ok
 
     @ti.func
@@ -1112,35 +1688,56 @@ class PrimBVH:
                 node_idx = current
                 node = self.nodes[node_idx]
                 current = 0
-                if aabb_hit(node.aabb_min, node.aabb_max, r, ray_t.min, closest_so_far) != 0:
-                    if (node.is_leaf == 1) | (node.prim_count > 0):
-                        for i in range(node.prim_count):
-                            raw_ref = self.prim_indices[node.first_prim + i]
+                if (
+                    aabb_hit(node.aabb_min, node.aabb_max, r, ray_t.min, closest_so_far)
+                    != 0
+                ):
+                    if node.count > 0:
+                        for i in range(node.count):
+                            raw_ref = self.prim_indices[node.left_or_first + i]
                             prim_ref = raw_ref
                             if ti.static(self.indices_are_bvh_indices):
                                 prim_ref = self.prim_refs[raw_ref]
                             hit_ok = ti.cast(0, ti.u8)
                             if PrimBVH._is_triangle_ref(prim_ref) != 0:
-                                hit_ok = self._hit_triangle_soa(PrimBVH._triangle_index(prim_ref), r, Interval(ray_t.min, closest_so_far), rec, x, y)
+                                hit_ok = self._hit_triangle_soa(
+                                    PrimBVH._triangle_index(prim_ref),
+                                    r,
+                                    Interval(ray_t.min, closest_so_far),
+                                    rec,
+                                    x,
+                                    y,
+                                )
                             else:
                                 prim = self.primitives[prim_ref]
-                                hit_ok = self._primitive_hit_enabled(prim, r, Interval(ray_t.min, closest_so_far), rec, x, y)
+                                hit_ok = self._primitive_hit_enabled(
+                                    prim,
+                                    r,
+                                    Interval(ray_t.min, closest_so_far),
+                                    rec,
+                                    x,
+                                    y,
+                                )
                             if hit_ok != 0:
                                 did_hit = 1
                                 closest_so_far = rec[x, y].t
                                 rec[x, y].prim_id = prim_ref
                     else:
-                        left_child = 2 * node_idx
-                        right_child = 2 * node_idx + 1
+                        left_child = node.left_or_first
+                        right_child = node.left_or_first + 1
                         has_l = left_child <= self.node_count
                         has_r = right_child <= self.node_count
                         if has_l & has_r:
                             nl = self.nodes[left_child]
                             nr = self.nodes[right_child]
-                            t_l = aabb_ray_t_enter(nl.aabb_min, nl.aabb_max, r, ray_t.min, closest_so_far)
-                            t_r = aabb_ray_t_enter(nr.aabb_min, nr.aabb_max, r, ray_t.min, closest_so_far)
-                            hit_l = t_l < 1e+29
-                            hit_r = t_r < 1e+29
+                            t_l = aabb_ray_t_enter(
+                                nl.aabb_min, nl.aabb_max, r, ray_t.min, closest_so_far
+                            )
+                            t_r = aabb_ray_t_enter(
+                                nr.aabb_min, nr.aabb_max, r, ray_t.min, closest_so_far
+                            )
+                            hit_l = t_l < 1e29
+                            hit_r = t_r < 1e29
                             if hit_l & hit_r:
                                 if t_l < t_r:
                                     if stack_ptr < self.HIT_STACK_SIZE - 1:
@@ -1181,7 +1778,11 @@ class PrimBVH:
         current = 1
         t_max = ray_t.max
         step = 0
-        while (step < self.MAX_SHADOW_STEPS) & (blocked == 0) & ((current > 0) | (stack_ptr > 0)):
+        while (
+            (step < self.MAX_SHADOW_STEPS)
+            & (blocked == 0)
+            & ((current > 0) | (stack_ptr > 0))
+        ):
             step += 1
             if blocked != 0:
                 break
@@ -1190,36 +1791,53 @@ class PrimBVH:
                 node = self.nodes[node_idx]
                 current = 0
                 if aabb_hit(node.aabb_min, node.aabb_max, r, ray_t.min, t_max) != 0:
-                    if (node.is_leaf == 1) | (node.prim_count > 0):
-                        for i in range(node.prim_count):
-                            raw_ref = self.prim_indices[node.first_prim + i]
+                    if node.count > 0:
+                        for i in range(node.count):
+                            raw_ref = self.prim_indices[node.left_or_first + i]
                             prim_ref = raw_ref
                             if ti.static(self.indices_are_bvh_indices):
                                 prim_ref = self.prim_refs[raw_ref]
                             if prim_ref != ignore_prim:
                                 bbox_slot = self._storage_slot(prim_ref)
-                                if aabb_hit(self.storage_bvh_min[bbox_slot], self.storage_bvh_max[bbox_slot], r, ray_t.min, t_max) != 0:
+                                if (
+                                    aabb_hit(
+                                        self.storage_bvh_min[bbox_slot],
+                                        self.storage_bvh_max[bbox_slot],
+                                        r,
+                                        ray_t.min,
+                                        t_max,
+                                    )
+                                    != 0
+                                ):
                                     shadow_hit = 0
                                     if PrimBVH._is_triangle_ref(prim_ref) != 0:
-                                        shadow_hit = self._occludes_triangle_soa(PrimBVH._triangle_index(prim_ref), r, ray_t)
+                                        shadow_hit = self._occludes_triangle_soa(
+                                            PrimBVH._triangle_index(prim_ref), r, ray_t
+                                        )
                                     else:
                                         prim = self.primitives[prim_ref]
-                                        shadow_hit = self._primitive_any_hit_enabled(prim, r, ray_t)
+                                        shadow_hit = self._primitive_any_hit_enabled(
+                                            prim, r, ray_t
+                                        )
                                     if shadow_hit != 0:
                                         blocked = 1
                                         break
                     else:
-                        left_child = 2 * node_idx
-                        right_child = 2 * node_idx + 1
+                        left_child = node.left_or_first
+                        right_child = node.left_or_first + 1
                         has_l = left_child <= self.node_count
                         has_r = right_child <= self.node_count
                         if has_l & has_r:
                             nl = self.nodes[left_child]
                             nr = self.nodes[right_child]
-                            t_l = aabb_ray_t_enter(nl.aabb_min, nl.aabb_max, r, ray_t.min, t_max)
-                            t_r = aabb_ray_t_enter(nr.aabb_min, nr.aabb_max, r, ray_t.min, t_max)
-                            hit_l = t_l < 1e+29
-                            hit_r = t_r < 1e+29
+                            t_l = aabb_ray_t_enter(
+                                nl.aabb_min, nl.aabb_max, r, ray_t.min, t_max
+                            )
+                            t_r = aabb_ray_t_enter(
+                                nr.aabb_min, nr.aabb_max, r, ray_t.min, t_max
+                            )
+                            hit_l = t_l < 1e29
+                            hit_r = t_r < 1e29
                             if hit_l & hit_r:
                                 if t_l < t_r:
                                     if stack_ptr < self.SHADOW_STACK_SIZE - 1:

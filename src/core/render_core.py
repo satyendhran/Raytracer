@@ -1,12 +1,19 @@
 import taichi as ti
 import taichi.math as tm
+
 vec3 = tm.vec3
+
 
 @ti.func
 def sanitize_rgb(c: vec3) -> vec3:
     bad = (c.x != c.x) | (c.y != c.y) | (c.z != c.z)
-    big = (ti.abs(c.x) > 100000000.0) | (ti.abs(c.y) > 100000000.0) | (ti.abs(c.z) > 100000000.0)
+    big = (
+        (ti.abs(c.x) > 100000000.0)
+        | (ti.abs(c.y) > 100000000.0)
+        | (ti.abs(c.z) > 100000000.0)
+    )
     return ti.select(bad | big, vec3(0.0, 0.0, 0.0), tm.clamp(c, 0.0, 10000.0))
+
 
 @ti.func
 def tonemap_filmic(c: vec3, exposure: ti.f32) -> vec3:

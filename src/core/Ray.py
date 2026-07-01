@@ -1,5 +1,6 @@
 import taichi as ti
 
+
 @ti.dataclass
 class Ray:
     origin: ti.math.vec3
