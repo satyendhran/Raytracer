@@ -3,7 +3,7 @@ import math
 import numpy as np
 from numba import njit
 
-DEFAULT_LEAF_SIZE = 2
+DEFAULT_LEAF_SIZE = 4
 
 
 def _expand_bits(v):

@@ -74,6 +74,44 @@ def aabb_ray_t_enter(
     return ti.select((miss != 0) | (t1 < t0), 1e30, t0)
 
 
+@ti.func
+def aabb_hit_inv(
+    aabb_min: vec3,
+    aabb_max: vec3,
+    origin: vec3,
+    inv_dir: vec3,
+    t_min: ti.f32,
+    t_max: ti.f32,
+) -> ti.i32:
+    t0 = t_min
+    t1 = t_max
+    for axis in ti.static(range(3)):
+        tn = (aabb_min[axis] - origin[axis]) * inv_dir[axis]
+        tf = (aabb_max[axis] - origin[axis]) * inv_dir[axis]
+        t0 = ti.max(ti.min(tn, tf), t0)
+        t1 = ti.min(ti.max(tn, tf), t1)
+    return ti.select(t1 >= ti.max(0.0, t0), 1, 0)
+
+
+@ti.func
+def aabb_ray_t_enter_inv(
+    aabb_min: vec3,
+    aabb_max: vec3,
+    origin: vec3,
+    inv_dir: vec3,
+    t_min: ti.f32,
+    t_max: ti.f32,
+) -> ti.f32:
+    t0 = t_min
+    t1 = t_max
+    for axis in ti.static(range(3)):
+        tn = (aabb_min[axis] - origin[axis]) * inv_dir[axis]
+        tf = (aabb_max[axis] - origin[axis]) * inv_dir[axis]
+        t0 = ti.max(ti.min(tn, tf), t0)
+        t1 = ti.min(ti.max(tn, tf), t1)
+    return ti.select(t1 < t0, 1e30, t0)
+
+
 class PythonBVHNode:
     def __init__(self):
         self.aabb_min = None

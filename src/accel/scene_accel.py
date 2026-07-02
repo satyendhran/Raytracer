@@ -4,7 +4,14 @@ import numpy as np
 import taichi as ti
 import taichi.math as tm
 
-from src.accel.BVH import BVHBuilder, BVHNode, aabb_hit, aabb_ray_t_enter
+from src.accel.BVH import (
+    BVHBuilder,
+    BVHNode,
+    aabb_hit,
+    aabb_hit_inv,
+    aabb_ray_t_enter,
+    aabb_ray_t_enter_inv,
+)
 from src.accel.BVHGPUSAH import GPUSAHBVHBuilder
 from src.core.interval import Interval
 from src.core.Ray import Ray
@@ -924,6 +931,7 @@ class PrimBVH:
         self.has_quad = False
         self.has_ellipsoid = False
         self.has_sdf = False
+        self.use_compact_nodes = False
         host_t0 = debug_tools.now() if debug_tools.enabled() else 0.0
         host_prims = (
             host_primitives
@@ -1253,7 +1261,7 @@ class PrimBVH:
             if debug_tools.enabled():
                 debug_tools.log("PrimBVH gpu_sah: starting Karras LBVH build")
 
-            builder = GPUSAHBVHBuilder(prim_mins, prim_maxs, prim_refs, leaf_size=2)
+            builder = GPUSAHBVHBuilder(prim_mins, prim_maxs, prim_refs, leaf_size=4)
             builder.build()
             gpu_sah_build_t = _pf() - gpu_sah_t0
 
@@ -1266,7 +1274,16 @@ class PrimBVH:
             upload_t0 = _pf()
             import numpy as _np
             node_shape = max_idx + 1
-            self.nodes = BVHNode.field(shape=(node_shape,), layout=ti.Layout.SOA)
+            self.use_compact_nodes = True
+            self.nodes = None
+            self.node_aabb_min = ti.Vector.field(
+                3, dtype=ti.f32, shape=(node_shape,), layout=ti.Layout.SOA
+            )
+            self.node_aabb_max = ti.Vector.field(
+                3, dtype=ti.f32, shape=(node_shape,), layout=ti.Layout.SOA
+            )
+            self.node_left_or_first = ti.field(dtype=ti.i32, shape=(node_shape,))
+            self.node_count_or_zero = ti.field(dtype=ti.i32, shape=(node_shape,))
             h_mn = builder.heap_aabb_min
             h_mx = builder.heap_aabb_max
             h_lf = builder.heap_left_or_first
@@ -1277,11 +1294,10 @@ class PrimBVH:
                 h_mx = _np.pad(h_mx, ((0, pad), (0, 0)), constant_values=0.0)
                 h_lf = _np.pad(h_lf, (0, pad), constant_values=0)
                 h_c = _np.pad(h_c, (0, pad), constant_values=0)
-            self.nodes.aabb_min.from_numpy(h_mn[:node_shape])
-            self.nodes.aabb_max.from_numpy(h_mx[:node_shape])
-            self.nodes.left_or_first.from_numpy(h_lf[:node_shape])
-            self.nodes.count.from_numpy(h_c[:node_shape])
-            self.nodes.prim_count.from_numpy(h_c[:node_shape])
+            self.node_aabb_min.from_numpy(h_mn[:node_shape])
+            self.node_aabb_max.from_numpy(h_mx[:node_shape])
+            self.node_left_or_first.from_numpy(h_lf[:node_shape])
+            self.node_count_or_zero.from_numpy(h_c[:node_shape])
 
             self.prim_indices = ti.field(dtype=ti.i32, shape=(max(n_prims, 1),))
             prim_idx_np = _np.asarray(builder.ordered_prim_indices, dtype=_np.int32)
@@ -1355,7 +1371,9 @@ class PrimBVH:
                 debug_tools.log(f"PrimBVH init end ({debug_tools.now() - init_t0:.3f}s)")
 
     def resident_memory_estimate_bytes(self) -> int:
-        node_bytes = int(self.node_count + 1) * (6 * 4 + 4 * 4)
+        node_bytes = int(self.node_count + 1) * (
+            (6 * 4 + 2 * 4) if self.use_compact_nodes else (6 * 4 + 3 * 4)
+        )
         prim_index_bytes = max(int(self.prim_count), 1) * 4
         bvh_bounds_bytes = max(int(self.bvh_prim_count), 1) * (2 * 3 * 4 + 4)
         storage_bounds_bytes = max(
@@ -1682,19 +1700,39 @@ class PrimBVH:
         stack_ptr = 0
         current = 1
         step = 0
+        safe_dir = vec3(
+            ti.select(ti.abs(r.direction.x) < 1e-12, 1e-12, r.direction.x),
+            ti.select(ti.abs(r.direction.y) < 1e-12, 1e-12, r.direction.y),
+            ti.select(ti.abs(r.direction.z) < 1e-12, 1e-12, r.direction.z),
+        )
+        inv_dir = 1.0 / safe_dir
         while (step < self.MAX_HIT_STEPS) & ((current > 0) | (stack_ptr > 0)):
             step += 1
             if (current > 0) & (current <= self.node_count):
                 node_idx = current
-                node = self.nodes[node_idx]
                 current = 0
+                node_min = vec3(0.0)
+                node_max = vec3(0.0)
+                left_or_first = 0
+                count = 0
+                if ti.static(self.use_compact_nodes):
+                    node_min = self.node_aabb_min[node_idx]
+                    node_max = self.node_aabb_max[node_idx]
+                    left_or_first = self.node_left_or_first[node_idx]
+                    count = self.node_count_or_zero[node_idx]
+                else:
+                    node = self.nodes[node_idx]
+                    node_min = node.aabb_min
+                    node_max = node.aabb_max
+                    left_or_first = node.left_or_first
+                    count = node.count
                 if (
-                    aabb_hit(node.aabb_min, node.aabb_max, r, ray_t.min, closest_so_far)
+                    aabb_hit_inv(node_min, node_max, r.origin, inv_dir, ray_t.min, closest_so_far)
                     != 0
                 ):
-                    if node.count > 0:
-                        for i in range(node.count):
-                            raw_ref = self.prim_indices[node.left_or_first + i]
+                    if count > 0:
+                        for i in range(count):
+                            raw_ref = self.prim_indices[left_or_first + i]
                             prim_ref = raw_ref
                             if ti.static(self.indices_are_bvh_indices):
                                 prim_ref = self.prim_refs[raw_ref]
@@ -1723,18 +1761,32 @@ class PrimBVH:
                                 closest_so_far = rec[x, y].t
                                 rec[x, y].prim_id = prim_ref
                     else:
-                        left_child = node.left_or_first
-                        right_child = node.left_or_first + 1
+                        left_child = left_or_first
+                        right_child = left_or_first + 1
                         has_l = left_child <= self.node_count
                         has_r = right_child <= self.node_count
                         if has_l & has_r:
-                            nl = self.nodes[left_child]
-                            nr = self.nodes[right_child]
-                            t_l = aabb_ray_t_enter(
-                                nl.aabb_min, nl.aabb_max, r, ray_t.min, closest_so_far
+                            lmin = vec3(0.0)
+                            lmax = vec3(0.0)
+                            rmin = vec3(0.0)
+                            rmax = vec3(0.0)
+                            if ti.static(self.use_compact_nodes):
+                                lmin = self.node_aabb_min[left_child]
+                                lmax = self.node_aabb_max[left_child]
+                                rmin = self.node_aabb_min[right_child]
+                                rmax = self.node_aabb_max[right_child]
+                            else:
+                                nl = self.nodes[left_child]
+                                nr = self.nodes[right_child]
+                                lmin = nl.aabb_min
+                                lmax = nl.aabb_max
+                                rmin = nr.aabb_min
+                                rmax = nr.aabb_max
+                            t_l = aabb_ray_t_enter_inv(
+                                lmin, lmax, r.origin, inv_dir, ray_t.min, closest_so_far
                             )
-                            t_r = aabb_ray_t_enter(
-                                nr.aabb_min, nr.aabb_max, r, ray_t.min, closest_so_far
+                            t_r = aabb_ray_t_enter_inv(
+                                rmin, rmax, r.origin, inv_dir, ray_t.min, closest_so_far
                             )
                             hit_l = t_l < 1e29
                             hit_r = t_r < 1e29
@@ -1778,6 +1830,12 @@ class PrimBVH:
         current = 1
         t_max = ray_t.max
         step = 0
+        safe_dir = vec3(
+            ti.select(ti.abs(r.direction.x) < 1e-12, 1e-12, r.direction.x),
+            ti.select(ti.abs(r.direction.y) < 1e-12, 1e-12, r.direction.y),
+            ti.select(ti.abs(r.direction.z) < 1e-12, 1e-12, r.direction.z),
+        )
+        inv_dir = 1.0 / safe_dir
         while (
             (step < self.MAX_SHADOW_STEPS)
             & (blocked == 0)
@@ -1788,22 +1846,37 @@ class PrimBVH:
                 break
             if (current > 0) & (current <= self.node_count):
                 node_idx = current
-                node = self.nodes[node_idx]
                 current = 0
-                if aabb_hit(node.aabb_min, node.aabb_max, r, ray_t.min, t_max) != 0:
-                    if node.count > 0:
-                        for i in range(node.count):
-                            raw_ref = self.prim_indices[node.left_or_first + i]
+                node_min = vec3(0.0)
+                node_max = vec3(0.0)
+                left_or_first = 0
+                count = 0
+                if ti.static(self.use_compact_nodes):
+                    node_min = self.node_aabb_min[node_idx]
+                    node_max = self.node_aabb_max[node_idx]
+                    left_or_first = self.node_left_or_first[node_idx]
+                    count = self.node_count_or_zero[node_idx]
+                else:
+                    node = self.nodes[node_idx]
+                    node_min = node.aabb_min
+                    node_max = node.aabb_max
+                    left_or_first = node.left_or_first
+                    count = node.count
+                if aabb_hit_inv(node_min, node_max, r.origin, inv_dir, ray_t.min, t_max) != 0:
+                    if count > 0:
+                        for i in range(count):
+                            raw_ref = self.prim_indices[left_or_first + i]
                             prim_ref = raw_ref
                             if ti.static(self.indices_are_bvh_indices):
                                 prim_ref = self.prim_refs[raw_ref]
                             if prim_ref != ignore_prim:
                                 bbox_slot = self._storage_slot(prim_ref)
                                 if (
-                                    aabb_hit(
+                                    aabb_hit_inv(
                                         self.storage_bvh_min[bbox_slot],
                                         self.storage_bvh_max[bbox_slot],
-                                        r,
+                                        r.origin,
+                                        inv_dir,
                                         ray_t.min,
                                         t_max,
                                     )
@@ -1823,18 +1896,32 @@ class PrimBVH:
                                         blocked = 1
                                         break
                     else:
-                        left_child = node.left_or_first
-                        right_child = node.left_or_first + 1
+                        left_child = left_or_first
+                        right_child = left_or_first + 1
                         has_l = left_child <= self.node_count
                         has_r = right_child <= self.node_count
                         if has_l & has_r:
-                            nl = self.nodes[left_child]
-                            nr = self.nodes[right_child]
-                            t_l = aabb_ray_t_enter(
-                                nl.aabb_min, nl.aabb_max, r, ray_t.min, t_max
+                            lmin = vec3(0.0)
+                            lmax = vec3(0.0)
+                            rmin = vec3(0.0)
+                            rmax = vec3(0.0)
+                            if ti.static(self.use_compact_nodes):
+                                lmin = self.node_aabb_min[left_child]
+                                lmax = self.node_aabb_max[left_child]
+                                rmin = self.node_aabb_min[right_child]
+                                rmax = self.node_aabb_max[right_child]
+                            else:
+                                nl = self.nodes[left_child]
+                                nr = self.nodes[right_child]
+                                lmin = nl.aabb_min
+                                lmax = nl.aabb_max
+                                rmin = nr.aabb_min
+                                rmax = nr.aabb_max
+                            t_l = aabb_ray_t_enter_inv(
+                                lmin, lmax, r.origin, inv_dir, ray_t.min, t_max
                             )
-                            t_r = aabb_ray_t_enter(
-                                nr.aabb_min, nr.aabb_max, r, ray_t.min, t_max
+                            t_r = aabb_ray_t_enter_inv(
+                                rmin, rmax, r.origin, inv_dir, ray_t.min, t_max
                             )
                             hit_l = t_l < 1e29
                             hit_r = t_r < 1e29

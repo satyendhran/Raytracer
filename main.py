@@ -95,11 +95,16 @@ class Camera:
         dark_background: int = 0,
         use_nee: int = 1,
         max_bounces: int = 12,
+        enable_restir: bool = False,
+        enable_denoise: bool = False,
     ):
         self.samples_per_pixel = 64
         self.pixel_sample_scale = 1.0 / self.samples_per_pixel
         self.offline_batch_size = 8
         self.debug_mode = False
+        self.enable_restir = bool(enable_restir)
+        self.enable_denoise = bool(enable_denoise)
+        self.enable_edge_buffers = self.enable_restir or self.enable_denoise
         self.image_width = image_width
         self.image_height = max(1, int(image_width / aspect_ratio))
         self.img = ti.Vector.field(
@@ -177,24 +182,48 @@ class Camera:
         self.use_restir[None] = 0
         self.restir_temporal = ti.field(dtype=ti.f32, shape=())
         self.restir_temporal[None] = 0.75
-        self.restir_curr_direct = ti.Vector.field(
-            3, ti.f32, shape=(self.image_width, self.image_height), layout=ti.Layout.SOA
-        )
-        self.restir_reuse_direct = ti.Vector.field(
-            3, ti.f32, shape=(self.image_width, self.image_height), layout=ti.Layout.SOA
-        )
+        if self.enable_restir:
+            self.restir_curr_direct = ti.Vector.field(
+                3,
+                ti.f32,
+                shape=(self.image_width, self.image_height),
+                layout=ti.Layout.SOA,
+            )
+            self.restir_reuse_direct = ti.Vector.field(
+                3,
+                ti.f32,
+                shape=(self.image_width, self.image_height),
+                layout=ti.Layout.SOA,
+            )
+        if self.enable_edge_buffers:
+            self.edge_normal = ti.Vector.field(
+                3,
+                ti.f32,
+                shape=(self.image_width, self.image_height),
+                layout=ti.Layout.SOA,
+            )
+            self.edge_depth = ti.field(
+                dtype=ti.f32, shape=(self.image_width, self.image_height)
+            )
         self.denoise_enabled = ti.field(dtype=ti.i32, shape=())
         self.denoise_enabled[None] = 0
         self.denoise_iterations = ti.field(dtype=ti.i32, shape=())
-        self.denoise_iterations[None] = 4
+        self.denoise_iterations[None] = 3
         self.denoise_phi_color = ti.field(dtype=ti.f32, shape=())
-        self.denoise_phi_color[None] = 0.12
-        self.denoise_ping = ti.Vector.field(
-            3, ti.f32, shape=(self.image_width, self.image_height), layout=ti.Layout.SOA
-        )
-        self.denoise_pong = ti.Vector.field(
-            3, ti.f32, shape=(self.image_width, self.image_height), layout=ti.Layout.SOA
-        )
+        self.denoise_phi_color[None] = 0.055
+        if self.enable_denoise:
+            self.denoise_ping = ti.Vector.field(
+                3,
+                ti.f32,
+                shape=(self.image_width, self.image_height),
+                layout=ti.Layout.SOA,
+            )
+            self.denoise_pong = ti.Vector.field(
+                3,
+                ti.f32,
+                shape=(self.image_width, self.image_height),
+                layout=ti.Layout.SOA,
+            )
         self.camera_center[None] = lookfrom
         self.lookat_f[None] = lookat
         self.vup_f[None] = vup
@@ -377,23 +406,29 @@ class Camera:
                                 mis_w = self.power_heuristic(light_pdf, bsdf_pdf)
                                 geom = cos_x * cos_l * A / ti.max(dist2, 1e-06)
                                 contrib = brdf * Le * geom * mis_w
-                                if self.use_restir[None] != 0:
-                                    w = ti.max(self.luminance(contrib), 1e-08)
-                                    wsum += w
-                                    m += 1
-                                    if ti.random() < w / ti.max(wsum, 1e-08):
-                                        selected = contrib
-                                        selected_w = w
+                                if ti.static(self.enable_restir):
+                                    if self.use_restir[None] != 0:
+                                        w = ti.max(self.luminance(contrib), 1e-08)
+                                        wsum += w
+                                        m += 1
+                                        if ti.random() < w / ti.max(wsum, 1e-08):
+                                            selected = contrib
+                                            selected_w = w
+                                    else:
+                                        acc += contrib
                                 else:
                                     acc += contrib
         result = acc / ti.cast(ns, ti.f32)
-        if self.use_restir[None] != 0:
-            local = vec3(0.0, 0.0, 0.0)
-            if m > 0:
-                local = selected * wsum / ti.max(selected_w * ti.cast(ns, ti.f32), 1e-08)
-            reused = self.restir_reuse_direct[i, j]
-            result = 0.78 * local + 0.22 * reused
-            self.restir_curr_direct[i, j] = local
+        if ti.static(self.enable_restir):
+            if self.use_restir[None] != 0:
+                local = vec3(0.0, 0.0, 0.0)
+                if m > 0:
+                    local = selected * wsum / ti.max(
+                        selected_w * ti.cast(ns, ti.f32), 1e-08
+                    )
+                reused = self.restir_reuse_direct[i, j]
+                result = 0.78 * local + 0.22 * reused
+                self.restir_curr_direct[i, j] = local
         return result
 
     @ti.func
@@ -542,6 +577,10 @@ class Camera:
                 != 0
             ):
                 hr = self.hit_rec[i, j]
+                if ti.static(self.enable_edge_buffers):
+                    if depth == 0:
+                        self.edge_depth[i, j] = hr.t
+                        self.edge_normal[i, j] = hr.geo_normal
                 mat_idx = ti.math.clamp(hr.mat_id, 0, self.material_count[None] - 1)
                 mat = materials[mat_idx]
                 if mat.material_type == 3:
@@ -583,6 +622,10 @@ class Camera:
                 else:
                     alive = 0
             else:
+                if ti.static(self.enable_edge_buffers):
+                    if depth == 0:
+                        self.edge_depth[i, j] = 1e20
+                        self.edge_normal[i, j] = vec3(0.0, 0.0, 0.0)
                 unit_dir = tm.normalize(ray.direction)
                 a = 0.5 * (unit_dir.y + 1.0)
                 sky = (1.0 - a) * tm.vec3(1.0) + a * tm.vec3(0.5, 0.7, 1.0)
@@ -634,15 +677,23 @@ class Camera:
     def clear_accum(self):
         for i, j in self.color_accum:
             self.color_accum[i, j] = vec3(0.0, 0.0, 0.0)
-            self.restir_curr_direct[i, j] = vec3(0.0, 0.0, 0.0)
-            self.restir_reuse_direct[i, j] = vec3(0.0, 0.0, 0.0)
+            if ti.static(self.enable_restir):
+                self.restir_curr_direct[i, j] = vec3(0.0, 0.0, 0.0)
+                self.restir_reuse_direct[i, j] = vec3(0.0, 0.0, 0.0)
+            if ti.static(self.enable_edge_buffers):
+                self.edge_depth[i, j] = 1e20
+                self.edge_normal[i, j] = vec3(0.0, 0.0, 0.0)
 
     @ti.kernel
     def trace_batch(self, batch_size: ti.i32):
         ti.loop_config(block_dim=128)
         for i, j in ti.ndrange(self.image_width, self.image_height):
             px = vec3(0.0, 0.0, 0.0)
-            self.restir_curr_direct[i, j] = vec3(0.0, 0.0, 0.0)
+            if ti.static(self.enable_restir):
+                self.restir_curr_direct[i, j] = vec3(0.0, 0.0, 0.0)
+            if ti.static(self.enable_edge_buffers):
+                self.edge_depth[i, j] = 1e20
+                self.edge_normal[i, j] = vec3(0.0, 0.0, 0.0)
             for s in range(batch_size):
                 r = self.get_ray(i, j, s)
                 px += self.trace_path(r, i, j)
@@ -654,12 +705,21 @@ class Camera:
         for i, j in ti.ndrange(self.image_width, self.image_height):
             c = self.restir_curr_direct[i, j]
             w = 1.0
+            d0 = self.edge_depth[i, j]
+            n0 = self.edge_normal[i, j]
             for ox, oy in ti.static(((1, 0), (-1, 0), (0, 1), (0, -1))):
                 x = i + ox
                 y = j + oy
                 if (x >= 0) & (x < self.image_width) & (y >= 0) & (y < self.image_height):
                     nbh = self.restir_curr_direct[x, y]
-                    cw = 1.0 / (1.0 + ti.abs(self.luminance(c) - self.luminance(nbh)) * 4.0)
+                    d1 = self.edge_depth[x, y]
+                    n1 = self.edge_normal[x, y]
+                    same_kind = ti.abs(d0 - d1) < 1e10
+                    depth_w = ti.exp(-ti.abs(d0 - d1) / ti.max(0.02 * ti.max(d0, 1.0), 1e-04))
+                    normal_w = ti.math.clamp(tm.dot(n0, n1), 0.0, 1.0)
+                    normal_w = normal_w * normal_w * normal_w * normal_w
+                    color_w = 1.0 / (1.0 + ti.abs(self.luminance(c) - self.luminance(nbh)) * 8.0)
+                    cw = ti.select(same_kind, depth_w * normal_w * color_w, 0.0)
                     c += nbh * cw
                     w += cw
             spatial = c / ti.max(w, 1e-06)
@@ -698,6 +758,8 @@ class Camera:
             acc = vec3(0.0, 0.0, 0.0)
             wsum = 0.0
             phi = ti.max(self.denoise_phi_color[None], 1e-04)
+            d0 = self.edge_depth[i, j]
+            n0 = self.edge_normal[i, j]
             for ox, oy in ti.static((
                 (-2, -2), (-1, -2), (0, -2), (1, -2), (2, -2),
                 (-2, -1), (-1, -1), (0, -1), (1, -1), (2, -1),
@@ -713,7 +775,15 @@ class Camera:
                 wy = ti.select(sy == 0, 6.0, ti.select(sy == 1, 4.0, 1.0))
                 sample = src[x, y]
                 diff = sample - center
-                edge = ti.exp(-tm.dot(diff, diff) / (phi * phi))
+                d1 = self.edge_depth[x, y]
+                n1 = self.edge_normal[x, y]
+                env_pair = (d0 > 1e10) & (d1 > 1e10)
+                same_kind = env_pair | (ti.abs(d0 - d1) < 1e10)
+                color_w = ti.exp(-tm.dot(diff, diff) / (phi * phi))
+                depth_w = ti.exp(-ti.abs(d0 - d1) / ti.max(0.015 * ti.max(d0, 1.0), 1e-04))
+                normal_w = ti.math.clamp(tm.dot(n0, n1), 0.0, 1.0)
+                normal_w = ti.select(env_pair, 1.0, normal_w * normal_w * normal_w * normal_w)
+                edge = ti.select(same_kind, color_w * depth_w * normal_w, 0.0)
                 wt = wx * wy * edge
                 acc += sample * wt
                 wsum += wt
@@ -743,7 +813,7 @@ class Camera:
             self._debug_taichi_return(
                 f"trace_batch {done}/{int(self.samples_per_pixel)} spp", t0
             )
-            if int(self.use_restir[None]) != 0:
+            if self.enable_restir and int(self.use_restir[None]) != 0:
                 self._debug_taichi_launch("restir_spatiotemporal_pass")
                 self.restir_spatiotemporal_pass()
                 self._debug_taichi_return("restir_spatiotemporal_pass")
@@ -752,7 +822,7 @@ class Camera:
                     f"  completed {done}/{int(self.samples_per_pixel)} spp", flush=True
                 )
         t0 = pf()
-        if int(self.denoise_enabled[None]) != 0:
+        if self.enable_denoise and int(self.denoise_enabled[None]) != 0:
             self._debug_taichi_launch("denoise")
             self.prepare_denoise_input()
             iterations = max(1, min(6, int(self.denoise_iterations[None])))
@@ -984,14 +1054,14 @@ def main():
     parser.add_argument(
         "--denoise-iterations",
         type=int,
-        default=4,
+        default=3,
         help="A-Trous denoise passes, capped to 1..6.",
     )
     parser.add_argument(
         "--denoise-phi-color",
         type=float,
-        default=0.12,
-        help="À-Trous color edge threshold. Lower preserves edges, higher smooths more.",
+        default=0.055,
+        help="A-Trous color edge threshold. Lower preserves edges, higher smooths more.",
     )
     parser.add_argument(
         "--ray-epsilon",
@@ -1113,13 +1183,16 @@ def _render_one_scene(args):
                 use_hdr_accum=True,
                 dark_background=dark_bg,
                 max_bounces=int(cam.get("max_bounces", 12)),
+                enable_restir=bool(args.restir),
+                enable_denoise=bool(args.denoise),
             )
         camera.debug_mode = bool(args.debug)
         with debug_tools.span("configure camera lights"):
             camera.set_lights(cam.get("nee_lights", []), use_nee_host)
         scene_light_samples = int(cam.get("light_samples", 4))
+        default_light_samples = 1 if args.restir and args.light_samples == 0 else scene_light_samples
         camera.light_samples[None] = max(
-            1, min(8, int(args.light_samples or scene_light_samples))
+            1, min(8, int(args.light_samples or default_light_samples))
         )
         scene_nee_depth = int(cam.get("nee_max_depth", 4))
         camera.nee_max_depth[None] = max(
@@ -1156,7 +1229,7 @@ def _render_one_scene(args):
             camera._debug_taichi_launch("progressive_step_accum")
             camera.progressive_step_accum()
             camera._debug_taichi_return("progressive_step_accum", t0)
-            if int(camera.use_restir[None]) != 0:
+            if camera.enable_restir and int(camera.use_restir[None]) != 0:
                 camera.restir_spatiotemporal_pass()
             t0 = pf()
             camera._debug_taichi_launch("tonemap_accum_to_display")
@@ -1194,6 +1267,8 @@ def _render_one_scene(args):
             use_hdr_accum=False,
             dark_background=dark_bg,
             max_bounces=int(cam.get("max_bounces", 12)),
+            enable_restir=bool(args.restir),
+            enable_denoise=bool(args.denoise),
         )
     camera.debug_mode = bool(args.debug)
     with debug_tools.span("configure camera lights"):
@@ -1206,8 +1281,9 @@ def _render_one_scene(args):
     camera.offline_batch_size = max(1, int(args.offline_batch_size))
     camera.exposure[None] = float(cam.get("exposure", 0.85))
     scene_light_samples = int(cam.get("light_samples", 4))
+    default_light_samples = 1 if args.restir and args.light_samples == 0 else scene_light_samples
     camera.light_samples[None] = max(
-        1, min(8, int(args.light_samples or scene_light_samples))
+        1, min(8, int(args.light_samples or default_light_samples))
     )
     scene_nee_depth = int(cam.get("nee_max_depth", 4))
     camera.nee_max_depth[None] = max(
