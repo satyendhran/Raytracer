@@ -1334,7 +1334,7 @@ class PrimBVH:
             self.prim_indices = ti.field(dtype=ti.i32, shape=(max(n_prims, 1),))
             self.prim_count = n_prims
             for i in range(1, max_idx + 1):
-                node = builder.nodes[i]
+                node = builder.nodes[i] if i < len(builder.nodes) else None
                 if node is not None:
                     self.nodes[i].aabb_min = vec3(
                         float(node.aabb_min[0]),
