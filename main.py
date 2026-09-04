@@ -381,9 +381,10 @@ class Camera:
 
     @ti.func
     def power_heuristic(self, pdf_a: ti.f32, pdf_b: ti.f32) -> ti.f32:
-        a2 = pdf_a * pdf_a
-        b2 = pdf_b * pdf_b
-        return a2 / ti.max(a2 + b2, 1e-08)
+        scale = ti.max(ti.max(pdf_a, pdf_b), 1e-30)
+        a2 = (pdf_a / scale) ** 2
+        b2 = (pdf_b / scale) ** 2
+        return a2 / ti.max(a2 + b2, 1e-30)
 
     @ti.func
     def offset_ray_origin(
@@ -397,7 +398,7 @@ class Camera:
 
     @ti.func
     def sample_area_light(
-        self, p: vec3, n: vec3, albedo: vec3, i: ti.i32, j: ti.i32
+        self, p: vec3, n: vec3, albedo: vec3, i: ti.i32, j: ti.i32, ray_time: ti.f32
     ) -> vec3:
         acc = vec3(0.0, 0.0, 0.0)
         cnt = self.nee_count[None]
@@ -417,12 +418,8 @@ class Camera:
                 for s in range(8):
                     if s < ns:
                         ns_f = ti.cast(ns, ti.f32)
-                        s_f = ti.cast(s, ti.f32)
-                        su = (s_f + ti.random()) / ns_f
-                        sv_seed = (s_f + ti.random()) * 0.61803398875 + ti.cast(
-                            k, ti.f32
-                        ) * 0.37
-                        sv = sv_seed - ti.floor(sv_seed)
+                        su = (ti.cast(s, ti.f32) + ti.random()) / ns_f
+                        sv = ti.random()
                         xl = Q + su * u + sv * v
                         disp_pre = xl - p
                         dist = tm.length(disp_pre)
@@ -439,11 +436,11 @@ class Camera:
                         dist2 = tm.dot(disp, disp)
                         dist = ti.sqrt(ti.max(dist2, 1e-08))
                         wi = disp / dist
-                        cos_x = ti.abs(tm.dot(n, wi))
-                        cos_l = tm.dot(nL, -wi)
+                        cos_x = ti.max(tm.dot(n, wi), 0.0)
+                        cos_l = ti.abs(tm.dot(nL, -wi))
                         geom_ok = (cos_x > 1e-05) & (cos_l > 1e-05) & (dist > 0.0001)
                         if geom_ok:
-                            sh = Ray(roff, wi, 0.0, RAY_SHADOW)
+                            sh = Ray(roff, wi, ray_time, RAY_SHADOW)
                             eps = self.shadow_epsilon[None]
                             blocked = self.bvh.any_hit(
                                 sh,
@@ -454,7 +451,7 @@ class Camera:
                                 brdf = albedo / ti.math.pi
                                 light_pdf = dist2 / ti.max(cos_l * A, 1e-06)
                                 bsdf_pdf = cos_x / ti.math.pi
-                                mis_w = self.power_heuristic(light_pdf, bsdf_pdf)
+                                mis_w = self.power_heuristic(ns_f * light_pdf, bsdf_pdf)
                                 geom = cos_x * cos_l * A / ti.max(dist2, 1e-06)
                                 contrib = brdf * Le * geom * mis_w
                                 if ti.static(self.enable_restir):
@@ -484,14 +481,16 @@ class Camera:
 
     @ti.func
     def clamp_bright_pixels(self, c: vec3) -> vec3:
-        return sanitize_rgb(tm.min(c, vec3(25.0)))
+        return sanitize_rgb(c)
 
     @ti.func
     def luminance(self, c: vec3) -> ti.f32:
         return 0.2126 * c.x + 0.7152 * c.y + 0.0722 * c.z
 
     @ti.func
-    def bsdf_light_mis_weight(self, ray: Ray, prev_p: vec3, prev_n: vec3) -> ti.f32:
+    def bsdf_light_mis_weight(
+        self, ray: Ray, prev_p: vec3, prev_n: vec3, hit_p: vec3
+    ) -> ti.f32:
         weight = 1.0
         if (self.use_nee[None] != 0) & (self.nee_count[None] > 0):
             best_pdf = 0.0
@@ -501,11 +500,12 @@ class Camera:
                     u = self.nee_u[k]
                     v = self.nee_v[k]
                     nL = self.nee_n[k]
-                    denom = tm.dot(nL, ray.direction)
+                    direction = tm.normalize(ray.direction)
+                    denom = tm.dot(nL, direction)
                     if ti.abs(denom) > 1e-08:
                         t = tm.dot(Q - prev_p, nL) / denom
                         if t > 0.0001:
-                            hp = prev_p + ray.direction * t
+                            hp = prev_p + direction * t
                             rel = hp - Q
                             uu = tm.dot(u, u)
                             uv = tm.dot(u, v)
@@ -517,16 +517,18 @@ class Camera:
                                 inv_det = 1.0 / det
                                 a = (wu * vv - wv * uv) * inv_det
                                 b = (uu * wv - uv * wu) * inv_det
-                                if (a >= 0.0) & (a <= 1.0) & (b >= 0.0) & (b <= 1.0):
+                                on_hit_light = tm.length(hp - hit_p) < 0.001 * ti.max(t, 1.0)
+                                if (a >= 0.0) & (a <= 1.0) & (b >= 0.0) & (b <= 1.0) & on_hit_light:
                                     area = self.nee_area[k]
                                     dist2 = tm.dot(hp - prev_p, hp - prev_p)
-                                    cos_l = ti.abs(tm.dot(nL, -ray.direction))
+                                    cos_l = ti.abs(tm.dot(nL, -direction))
                                     best_pdf = ti.max(
                                         best_pdf, dist2 / ti.max(cos_l * area, 1e-06)
                                     )
-            cos_x = ti.abs(tm.dot(prev_n, ray.direction))
+            cos_x = ti.max(tm.dot(prev_n, tm.normalize(ray.direction)), 0.0)
             bsdf_pdf = cos_x / ti.math.pi
-            weight = self.power_heuristic(bsdf_pdf, best_pdf)
+            ns = ti.cast(ti.min(ti.max(self.light_samples[None], 1), 8), ti.f32)
+            weight = self.power_heuristic(bsdf_pdf, ns * best_pdf)
         return weight
 
     @ti.func
@@ -645,7 +647,7 @@ class Camera:
                 if mat.material_type == 3:
                     emit_w = ti.select(
                         after_diffuse != 0,
-                        self.bsdf_light_mis_weight(ray, prev_p, prev_n),
+                        self.bsdf_light_mis_weight(ray, prev_p, prev_n, hr.p),
                         1.0,
                     )
                     rad += attenuation * mat.emitted * emit_w
@@ -659,7 +661,7 @@ class Camera:
                 if can_sample_direct:
                     alb = mat.texture.value(hr.u, hr.v, hr.p, hr.normal)
                     rad += attenuation * self.sample_area_light(
-                        hr.p, hr.normal, alb, i, j
+                        hr.p, hr.normal, alb, i, j, ray.tm
                     )
                 scatter_ok, scatter_atten, scatter_ray = self.scatter_material(
                     mat, ray, hr
@@ -669,7 +671,7 @@ class Camera:
                     prev_p = hr.p
                     prev_n = hr.normal
                     ray = scatter_ray
-                    after_diffuse = ti.select(mat.material_type == 0, 1, 0)
+                    after_diffuse = ti.cast(can_sample_direct, ti.i32)
                     depth += 1
                     if depth >= 3:
                         p_survive = ti.math.clamp(
