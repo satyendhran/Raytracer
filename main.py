@@ -21,6 +21,7 @@ from src.core.Rand import (random_cosine_direction, random_double,
                            refract)
 from src.core.Ray import Ray
 from src.core.render_core import sanitize_rgb, tonemap_filmic
+from src.core.sampling import PathSampler, cosine_direction
 from src.geometry.Objects import hit_record
 from src.scenes.registry import (ALL_TEST_SCENE_NAMES, TEST_SCENE_BUILDERS,
                                  print_scene_table)
@@ -108,6 +109,8 @@ class Camera:
         self.enable_denoise = bool(enable_denoise)
         self.enable_adaptive = bool(enable_adaptive)
         self.enable_edge_buffers = self.enable_restir or self.enable_denoise
+        self.sampler = PathSampler()
+        self.sample_offset = ti.field(ti.i32, shape=())
         self.image_width = image_width
         self.image_height = max(1, int(image_width / aspect_ratio))
         self.adaptive_tile_cols = (
@@ -398,7 +401,8 @@ class Camera:
 
     @ti.func
     def sample_area_light(
-        self, p: vec3, n: vec3, albedo: vec3, i: ti.i32, j: ti.i32, ray_time: ti.f32
+        self, p: vec3, n: vec3, albedo: vec3, i: ti.i32, j: ti.i32,
+        ray_time: ti.f32, sample_index: ti.i32, depth: ti.i32
     ) -> vec3:
         acc = vec3(0.0, 0.0, 0.0)
         cnt = self.nee_count[None]
@@ -418,8 +422,11 @@ class Camera:
                 for s in range(8):
                     if s < ns:
                         ns_f = ti.cast(ns, ti.f32)
-                        su = (ti.cast(s, ti.f32) + ti.random()) / ns_f
-                        sv = ti.random()
+                        pixel = i * self.image_height + j
+                        light_index = sample_index * ns + s
+                        stream = depth * self.NEE_LIGHT_CAPACITY + k + 1
+                        su = self.sampler.sample(pixel, light_index, 29, stream)
+                        sv = self.sampler.sample(pixel, light_index, 30, stream)
                         xl = Q + su * u + sv * v
                         disp_pre = xl - p
                         dist = tm.length(disp_pre)
@@ -532,12 +539,12 @@ class Camera:
         return weight
 
     @ti.func
-    def scatter_material(self, mat: Material, r_in: Ray, rec):
+    def scatter_material(self, mat: Material, r_in: Ray, rec, u: ti.f32, v: ti.f32):
         scatter_ok = 0
         attenuation = vec3(0.0, 0.0, 0.0)
         scattered = Ray(rec.p, rec.normal, r_in.tm, RAY_SECONDARY)
         if mat.material_type == 0:
-            scatter_direction = random_cosine_direction(rec.normal)
+            scatter_direction = cosine_direction(rec.normal, u, v)
             if (
                 (ti.abs(scatter_direction.x) < 1e-08)
                 & (ti.abs(scatter_direction.y) < 1e-08)
@@ -560,9 +567,11 @@ class Camera:
             attenuation = mat.texture.value(rec.u, rec.v, rec.p, rec.normal)
             scatter_ok = 1
         elif mat.material_type == 1:
-            reflected = (
-                reflect(r_in.direction, rec.normal) + mat.fuzz * random_unit_vec3()
-            )
+            z = 2.0 * u - 1.0
+            radius = ti.sqrt(ti.max(1.0 - z * z, 0.0))
+            phi = 2.0 * ti.math.pi * v
+            fuzz_direction = vec3(radius * ti.cos(phi), radius * ti.sin(phi), z)
+            reflected = reflect(tm.normalize(r_in.direction), rec.normal) + mat.fuzz * fuzz_direction
             scattered = Ray(
                 self.offset_ray_origin(
                     rec.p,
@@ -591,7 +600,7 @@ class Camera:
             reflectance = r0 + (1.0 - r0) * ti.pow(1.0 - costheta, 5)
             cannot_refract = sintheta * ri > 1.0
             direction = vec3(0.0, 0.0, 0.0)
-            if cannot_refract | (reflectance > ti.random()):
+            if cannot_refract | (reflectance > u):
                 direction = reflect(unit_direction, rec.normal)
             else:
                 direction = refract(unit_direction, rec.normal, ri)
@@ -612,7 +621,7 @@ class Camera:
         return (scatter_ok, attenuation, scattered)
 
     @ti.func
-    def trace_path(self, r: Ray, i: ti.i32, j: ti.i32) -> vec3:
+    def trace_path(self, r: Ray, i: ti.i32, j: ti.i32, sample_index: ti.i32) -> vec3:
         ray = r
         rad = vec3(0.0, 0.0, 0.0)
         attenuation = tm.vec3(1.0, 1.0, 1.0)
@@ -661,11 +670,12 @@ class Camera:
                 if can_sample_direct:
                     alb = mat.texture.value(hr.u, hr.v, hr.p, hr.normal)
                     rad += attenuation * self.sample_area_light(
-                        hr.p, hr.normal, alb, i, j, ray.tm
+                        hr.p, hr.normal, alb, i, j, ray.tm, sample_index, depth
                     )
-                scatter_ok, scatter_atten, scatter_ray = self.scatter_material(
-                    mat, ray, hr
-                )
+                pixel = i * self.image_height + j
+                u = self.sampler.sample(pixel, sample_index, 5 + 2 * depth, 0)
+                v = self.sampler.sample(pixel, sample_index, 6 + 2 * depth, 0)
+                scatter_ok, scatter_atten, scatter_ray = self.scatter_material(mat, ray, hr, u, v)
                 if scatter_ok != 0:
                     attenuation *= scatter_atten
                     prev_p = hr.p
@@ -677,7 +687,8 @@ class Camera:
                         p_survive = ti.math.clamp(
                             self.luminance(attenuation), 0.08, 0.95
                         )
-                        if ti.random() > p_survive:
+                        roulette = self.sampler.sample(pixel, sample_index, 31, depth)
+                        if roulette > p_survive:
                             alive = 0
                         attenuation /= p_survive
                 else:
@@ -709,19 +720,23 @@ class Camera:
 
     @ti.func
     def get_ray(self, i, j, sample: ti.i32):
-        offset = vec3(random_double(0, 1) - 0.5, random_double(0, 1) - 0.5, 0)
+        pixel = i * self.image_height + j
+        offset = vec3(
+            self.sampler.sample(pixel, sample, 0, 0) - 0.5,
+            self.sampler.sample(pixel, sample, 1, 0) - 0.5, 0.0,
+        )
         pixel_sample = (
             self.pixel00_loc[None]
             + (i + offset.x) * self.pixel_delta_u[None]
             + (j + offset.y) * self.pixel_delta_v[None]
         )
-        ray_origin = ti.select(
-            self.defocus_angle[None] <= 0,
-            self.camera_center[None],
-            self.defocus_disk_sample(),
-        )
+        ray_origin = self.camera_center[None]
+        if self.defocus_angle[None] > 0.0:
+            radius = ti.sqrt(self.sampler.sample(pixel, sample, 2, 0))
+            angle = 2.0 * ti.math.pi * self.sampler.sample(pixel, sample, 3, 0)
+            ray_origin += radius * (ti.cos(angle) * self.defocus_disk_u[None] + ti.sin(angle) * self.defocus_disk_v[None])
         ray_direction = pixel_sample - ray_origin
-        ray_time = random_double(0, 1)
+        ray_time = self.sampler.sample(pixel, sample, 4, 0)
         return Ray(ray_origin, ray_direction, ray_time, RAY_PRIMARY)
 
     def _debug_taichi_return(self, label: str, t0: float | None = None) -> None:
@@ -739,6 +754,7 @@ class Camera:
 
     @ti.kernel
     def clear_accum(self):
+        self.sample_offset[None] = 0
         for i, j in self.color_accum:
             self.color_accum[i, j] = vec3(0.0, 0.0, 0.0)
             if ti.static(self.enable_restir):
@@ -763,9 +779,11 @@ class Camera:
             if ti.static(self.enable_denoise):
                 self.edge_albedo[i, j] = vec3(0.0, 0.0, 0.0)
             for s in range(batch_size):
-                r = self.get_ray(i, j, s)
-                px += self.trace_path(r, i, j)
+                index = self.sample_offset[None] + s
+                r = self.get_ray(i, j, index)
+                px += self.trace_path(r, i, j, index)
             self.color_accum[i, j] += px
+        self.sample_offset[None] += batch_size
 
     @ti.kernel
     def restir_spatiotemporal_pass(self):
@@ -801,7 +819,7 @@ class Camera:
             px = vec3(0.0, 0.0, 0.0)
             for s in range(spp):
                 r = self.get_ray(i, j, s)
-                px += self.trace_path(r, i, j)
+                px += self.trace_path(r, i, j, s)
             linear = px / ti.cast(spp, ti.f32)
             mapped = tonemap_filmic(linear, self.exposure[None])
             self.img[i, self.image_height - 1 - j] = float_to_rgb8(mapped)
@@ -1015,8 +1033,8 @@ class Camera:
                     m2 = self.adaptive_m2[i, j]
                     for s in range(batch_size):
                         if count < max_spp:
-                            r = self.get_ray(i, j, s)
-                            sample = self.trace_path(r, i, j)
+                            r = self.get_ray(i, j, count)
+                            sample = self.trace_path(r, i, j, count)
                             count += 1
                             inv_count = 1.0 / ti.cast(count, ti.f32)
                             delta = sample - mean
@@ -1206,8 +1224,9 @@ class Camera:
             sy = 0.0
             sz = 0.0
             for _s in range(b):
-                r = self.get_ray(i, j, 0)
-                c = self.trace_path(r, i, j)
+                index = ti.cast(self.hdr_accum[i, j].w, ti.i32) + _s
+                r = self.get_ray(i, j, index)
+                c = self.trace_path(r, i, j, index)
                 sx += c.x
                 sy += c.y
                 sz += c.z
@@ -1318,8 +1337,8 @@ SCENE_DEFAULT_PNG["default"] = "checker_scene.png"
 
 def _quality_settings(args, scene_spp: int):
     quality = getattr(args, "quality", "normal")
-    requested_spp = int(args.spp)
-    user_set_spp = requested_spp != 64
+    user_set_spp = args.spp is not None
+    requested_spp = max(1, int(args.spp if user_set_spp else scene_spp))
     if quality == "manual":
         return dict(
             adaptive=False,
@@ -1334,11 +1353,11 @@ def _quality_settings(args, scene_spp: int):
             denoise_phi_color=float(args.denoise_phi_color),
         )
     if quality == "quick":
-        max_spp = min(requested_spp, 128) if user_set_spp else min(scene_spp, 96)
+        max_spp = requested_spp if user_set_spp else min(scene_spp, 96)
         return dict(
             adaptive=not bool(args.no_adaptive),
-            min_spp=max(4, min(max_spp, 12)),
-            max_spp=max(2, max_spp),
+            min_spp=min(max_spp, 12),
+            max_spp=max_spp,
             threshold=0.04,
             denoise=True,
             batch=max(32, int(args.offline_batch_size)),
@@ -1361,11 +1380,11 @@ def _quality_settings(args, scene_spp: int):
             denoise_iterations=int(args.denoise_iterations),
             denoise_phi_color=float(args.denoise_phi_color),
         )
-    max_spp = min(requested_spp, 512) if user_set_spp else min(scene_spp, 320)
+    max_spp = requested_spp if user_set_spp else min(scene_spp, 320)
     return dict(
         adaptive=not bool(args.no_adaptive),
-        min_spp=max(24, min(max_spp, 64)),
-        max_spp=max(4, max_spp),
+        min_spp=min(max_spp, 64),
+        max_spp=max_spp,
         threshold=0.016,
         denoise=True,
         batch=max(32, int(args.offline_batch_size)),
@@ -1412,8 +1431,15 @@ def main():
     parser.add_argument(
         "--spp",
         type=int,
-        default=64,
+        default=None,
         help="Samples per pixel (offline). Cornell scene defaults to 256 if unset.",
+    )
+    parser.add_argument(
+        "--sampler", choices=("sobol", "random"), default="sobol",
+        help="Sample pattern for camera rays, lights and path directions.",
+    )
+    parser.add_argument(
+        "--seed", type=int, default=0, help="Repeatable sampling seed.",
     )
     parser.add_argument(
         "--quality",
@@ -1512,6 +1538,8 @@ def main():
         help="Print completed milestones and synchronize timed Taichi work.",
     )
     args = parser.parse_args()
+    if args.width < 1 or (args.spp is not None and args.spp < 1):
+        parser.error("Width and sample count must be positive.")
     debug_tools.set_debug(args.debug)
     debug_tools.completed("debug mode enabled")
     with debug_tools.span("Taichi GPU startup probe"):
@@ -1533,7 +1561,7 @@ def main():
         os.makedirs(out_dir, exist_ok=True)
         total_t0 = pf()
         batch_w = args.width if args.width != 1920 else 1024
-        batch_spp = args.spp if args.spp != 64 else 256
+        batch_spp = args.spp if args.spp is not None else 256
         for scene_name in ALL_TEST_SCENE_NAMES:
             scene_args = argparse.Namespace(**vars(args))
             scene_args.scene = scene_name
@@ -1682,9 +1710,7 @@ def _render_one_scene(args):
     with debug_tools.span(
         f"create Camera {args.width}x{max(1, int(args.width / aspect_ratio))}"
     ):
-        scene_spp = args.spp
-        if args.spp == 64 and cam.get("default_spp"):
-            scene_spp = int(cam["default_spp"])
+        scene_spp = args.spp if args.spp is not None else int(cam.get("default_spp", 64))
         quality = _quality_settings(args, int(scene_spp))
         camera = Camera(
             bvh,
@@ -1704,6 +1730,8 @@ def _render_one_scene(args):
             enable_adaptive=bool(quality["adaptive"]),
         )
     camera.debug_mode = bool(args.debug)
+    camera.sampler.mode[None] = int(args.sampler == "sobol")
+    camera.sampler.seed[None] = args.seed & 0xFFFFFFFF
     with debug_tools.span("configure camera lights"):
         camera.set_lights(cam.get("nee_lights", []), use_nee_host)
     spp = int(quality["max_spp"])
