@@ -1,4 +1,5 @@
 import argparse
+import json
 import math
 import numbers
 import os
@@ -16,9 +17,7 @@ from src.accel.scene_accel import (KIND_QUAD, PrimBVH, ScenePrimitive,
                                    scene_primitive_sphere)
 from src.core.Color import float_to_rgb8
 from src.core.interval import Interval
-from src.core.Rand import (random_cosine_direction, random_double,
-                           random_in_unit_disk, random_unit_vec3, reflect,
-                           refract)
+from src.core.Rand import reflect, refract
 from src.core.Ray import Ray
 from src.core.render_core import sanitize_rgb, tonemap_filmic
 from src.core.sampling import PathSampler, cosine_direction
@@ -108,9 +107,12 @@ class Camera:
         self.enable_restir = bool(enable_restir)
         self.enable_denoise = bool(enable_denoise)
         self.enable_adaptive = bool(enable_adaptive)
+        self.adaptive_scheduler = "pixels"
         self.enable_edge_buffers = self.enable_restir or self.enable_denoise
         self.sampler = PathSampler()
         self.sample_offset = ti.field(ti.i32, shape=())
+        self.timings = {}
+        self.denoised_result = None
         self.image_width = image_width
         self.image_height = max(1, int(image_width / aspect_ratio))
         self.adaptive_tile_cols = (
@@ -163,15 +165,6 @@ class Camera:
         self.pixel_delta_v = ti.Vector.field(3, ti.f32, shape=())
         self.defocus_disk_u = ti.Vector.field(3, ti.f32, shape=())
         self.defocus_disk_v = ti.Vector.field(3, ti.f32, shape=())
-        self.atten = ti.Vector.field(
-            3,
-            dtype=ti.f32,
-            shape=(self.image_width, self.image_height),
-            layout=ti.Layout.SOA,
-        )
-        self.scattered = Ray.field(
-            shape=(self.image_width, self.image_height), layout=ti.Layout.SOA
-        )
         self.live_batch = ti.field(dtype=ti.i32, shape=())
         self.live_batch[None] = 1
         self.dark_background = ti.field(dtype=ti.i32, shape=())
@@ -232,6 +225,10 @@ class Camera:
         self.denoise_phi_color = ti.field(dtype=ti.f32, shape=())
         self.denoise_phi_color[None] = 0.055
         if self.enable_denoise:
+            self.sample_m2 = ti.Vector.field(
+                3, ti.f32, shape=(self.image_width, self.image_height), layout=ti.Layout.SOA
+            )
+            self.denoise_variance = ti.field(ti.f32, shape=(self.image_width, self.image_height))
             self.denoise_ping = ti.Vector.field(
                 3,
                 ti.f32,
@@ -245,6 +242,8 @@ class Camera:
                 layout=ti.Layout.SOA,
             )
         if self.enable_adaptive:
+            self.adaptive_pixel_indices = ti.field(ti.i32, shape=(2, self.image_width * self.image_height))
+            self.adaptive_stable = ti.field(ti.i32, shape=(self.image_width, self.image_height))
             self.adaptive_mean = ti.Vector.field(
                 3,
                 ti.f32,
@@ -481,8 +480,7 @@ class Camera:
                     local = selected * wsum / ti.max(
                         selected_w * ti.cast(ns, ti.f32), 1e-08
                     )
-                reused = self.restir_reuse_direct[i, j]
-                result = 0.78 * local + 0.22 * reused
+                result = local
                 self.restir_curr_direct[i, j] = local
         return result
 
@@ -639,20 +637,12 @@ class Camera:
                 != 0
             ):
                 hr = self.hit_rec[i, j]
-                if ti.static(self.enable_edge_buffers):
+                if ti.static(self.enable_restir and not self.enable_denoise):
                     if depth == 0:
                         self.edge_depth[i, j] = hr.t
                         self.edge_normal[i, j] = hr.geo_normal
                 mat_idx = ti.math.clamp(hr.mat_id, 0, self.material_count[None] - 1)
                 mat = materials[mat_idx]
-                if ti.static(self.enable_denoise):
-                    if depth == 0:
-                        guide = vec3(1.0, 1.0, 1.0)
-                        if mat.material_type == 0 or mat.material_type == 1:
-                            guide = mat.texture.value(hr.u, hr.v, hr.p, hr.normal)
-                        elif mat.material_type == 3:
-                            guide = vec3(0.0, 0.0, 0.0)
-                        self.edge_albedo[i, j] = guide
                 if mat.material_type == 3:
                     emit_w = ti.select(
                         after_diffuse != 0,
@@ -694,13 +684,10 @@ class Camera:
                 else:
                     alive = 0
             else:
-                if ti.static(self.enable_edge_buffers):
+                if ti.static(self.enable_restir and not self.enable_denoise):
                     if depth == 0:
                         self.edge_depth[i, j] = 1e20
                         self.edge_normal[i, j] = vec3(0.0, 0.0, 0.0)
-                if ti.static(self.enable_denoise):
-                    if depth == 0:
-                        self.edge_albedo[i, j] = vec3(0.0, 0.0, 0.0)
                 unit_dir = tm.normalize(ray.direction)
                 a = 0.5 * (unit_dir.y + 1.0)
                 sky = (1.0 - a) * tm.vec3(1.0) + a * tm.vec3(0.5, 0.7, 1.0)
@@ -708,15 +695,6 @@ class Camera:
                 rad += attenuation * bg
                 alive = 0
         return self.clamp_bright_pixels(rad)
-
-    @ti.func
-    def defocus_disk_sample(self):
-        p = random_in_unit_disk()
-        return (
-            self.camera_center[None]
-            + p.x * self.defocus_disk_u[None]
-            + p.y * self.defocus_disk_v[None]
-        )
 
     @ti.func
     def get_ray(self, i, j, sample: ti.i32):
@@ -765,24 +743,35 @@ class Camera:
                 self.edge_normal[i, j] = vec3(0.0, 0.0, 0.0)
             if ti.static(self.enable_denoise):
                 self.edge_albedo[i, j] = vec3(0.0, 0.0, 0.0)
+                self.sample_m2[i, j] = vec3(0.0)
 
     @ti.kernel
     def trace_batch(self, batch_size: ti.i32):
         ti.loop_config(block_dim=128)
         for i, j in ti.ndrange(self.image_width, self.image_height):
             px = vec3(0.0, 0.0, 0.0)
+            mean = vec3(0.0)
+            m2 = vec3(0.0)
+            if ti.static(self.enable_denoise):
+                mean = self.color_accum[i, j] / ti.max(ti.cast(self.sample_offset[None], ti.f32), 1.0)
+                m2 = self.sample_m2[i, j]
             if ti.static(self.enable_restir):
                 self.restir_curr_direct[i, j] = vec3(0.0, 0.0, 0.0)
-            if ti.static(self.enable_edge_buffers):
+            if ti.static(self.enable_restir and not self.enable_denoise):
                 self.edge_depth[i, j] = 1e20
                 self.edge_normal[i, j] = vec3(0.0, 0.0, 0.0)
-            if ti.static(self.enable_denoise):
-                self.edge_albedo[i, j] = vec3(0.0, 0.0, 0.0)
             for s in range(batch_size):
                 index = self.sample_offset[None] + s
                 r = self.get_ray(i, j, index)
-                px += self.trace_path(r, i, j, index)
+                value = self.trace_path(r, i, j, index)
+                px += value
+                if ti.static(self.enable_denoise):
+                    delta = value - mean
+                    mean += delta / ti.cast(index + 1, ti.f32)
+                    m2 += delta * (value - mean)
             self.color_accum[i, j] += px
+            if ti.static(self.enable_denoise):
+                self.sample_m2[i, j] = m2
         self.sample_offset[None] += batch_size
 
     @ti.kernel
@@ -835,48 +824,39 @@ class Camera:
     def prepare_denoise_input(self):
         for i, j in self.denoise_ping:
             self.denoise_ping[i, j] = self.color_accum[i, j] * self.pixel_sample_scale
+            count = ti.cast(self.sample_offset[None], ti.f32)
+            variance = tm.max(self.sample_m2[i, j], vec3(0.0)) / ti.max(count * (count - 1.0), 1.0)
+            self.denoise_variance[i, j] = tm.max(variance.x, ti.max(variance.y, variance.z))
 
     @ti.kernel
     def prepare_adaptive_denoise_input(self):
         for i, j in self.denoise_ping:
             self.denoise_ping[i, j] = self.adaptive_mean[i, j]
+            count = ti.cast(self.adaptive_count[i, j], ti.f32)
+            variance = tm.max(self.adaptive_m2[i, j], vec3(0.0)) / ti.max(count * (count - 1.0), 1.0)
+            self.denoise_variance[i, j] = tm.max(variance.x, ti.max(variance.y, variance.z))
 
     @ti.kernel
-    def clamp_fireflies(self, src: ti.template(), dst: ti.template()):
+    def prepare_surface_guides(self):
         ti.loop_config(block_dim=128)
         for i, j in ti.ndrange(self.image_width, self.image_height):
-            center = src[i, j]
-            center_luma = self.luminance(center)
-            neighbor_sum = vec3(0.0, 0.0, 0.0)
-            neighbor_w = 0.0
-            d0 = self.edge_depth[i, j]
-            n0 = self.edge_normal[i, j]
-            a0 = self.edge_albedo[i, j]
-            for ox, oy in ti.static((
-                (-1, -1), (0, -1), (1, -1),
-                (-1, 0), (1, 0),
-                (-1, 1), (0, 1), (1, 1),
-            )):
-                x = ti.math.clamp(i + ox, 0, self.image_width - 1)
-                y = ti.math.clamp(j + oy, 0, self.image_height - 1)
-                d1 = self.edge_depth[x, y]
-                n1 = self.edge_normal[x, y]
-                a1 = self.edge_albedo[x, y]
-                env_pair = (d0 > 1e10) & (d1 > 1e10)
-                same_kind = env_pair | (ti.abs(d0 - d1) < 1e10)
-                normal_w = ti.math.clamp(tm.dot(n0, n1), 0.0, 1.0)
-                normal_w = ti.select(env_pair, 1.0, normal_w * normal_w)
-                albedo_diff = a1 - a0
-                albedo_w = ti.exp(-tm.dot(albedo_diff, albedo_diff) / 0.06)
-                albedo_w = ti.select(env_pair, 1.0, albedo_w)
-                w = ti.select(same_kind, normal_w * albedo_w, 0.0)
-                neighbor_sum += src[x, y] * w
-                neighbor_w += w
-            avg = neighbor_sum / ti.max(neighbor_w, 1e-06)
-            avg_luma = self.luminance(avg)
-            limit = ti.max(avg_luma * 3.0 + 0.35, 2.0)
-            scale = ti.select(center_luma > limit, limit / ti.max(center_luma, 1e-06), 1.0)
-            dst[i, j] = center * scale
+            center = self.camera_center[None]
+            target = self.pixel00_loc[None] + i * self.pixel_delta_u[None] + j * self.pixel_delta_v[None]
+            ray = Ray(center, tm.normalize(target - center), 0.5, RAY_PRIMARY)
+            self.edge_depth[i, j] = 1e20
+            self.edge_normal[i, j] = vec3(0.0)
+            self.edge_albedo[i, j] = vec3(0.0)
+            if self.bvh.hit(ray, Interval(self.ray_epsilon[None], 1e30), self.hit_rec, i, j) != 0:
+                hr = self.hit_rec[i, j]
+                self.edge_depth[i, j] = hr.t
+                self.edge_normal[i, j] = hr.normal
+                mat = materials[ti.math.clamp(hr.mat_id, 0, self.material_count[None] - 1)]
+                guide = vec3(1.0)
+                if mat.material_type == 0 or mat.material_type == 1:
+                    guide = mat.texture.value(hr.u, hr.v, hr.p, hr.normal)
+                elif mat.material_type == 3:
+                    guide = vec3(0.0)
+                self.edge_albedo[i, j] = guide
 
     @ti.kernel
     def atrous_pass(self, src: ti.template(), dst: ti.template(), step: ti.i32):
@@ -909,7 +889,8 @@ class Camera:
                 a1 = self.edge_albedo[x, y]
                 env_pair = (d0 > 1e10) & (d1 > 1e10)
                 same_kind = env_pair | (ti.abs(d0 - d1) < 1e10)
-                color_w = ti.exp(-tm.dot(diff, diff) / (phi * phi))
+                variance = self.denoise_variance[i, j] + self.denoise_variance[x, y]
+                color_w = ti.exp(-tm.dot(diff, diff) / (phi * phi + 4.0 * variance + 1e-10))
                 depth_w = ti.exp(-ti.abs(d0 - d1) / ti.max(0.015 * ti.max(d0, 1.0), 1e-04))
                 normal_w = ti.math.clamp(tm.dot(n0, n1), 0.0, 1.0)
                 normal_w = ti.select(env_pair, 1.0, normal_w * normal_w * normal_w * normal_w)
@@ -921,46 +902,6 @@ class Camera:
                 acc += sample * wt
                 wsum += wt
             dst[i, j] = acc / ti.max(wsum, 1e-06)
-
-    @ti.kernel
-    def despeckle_pass(self, src: ti.template(), dst: ti.template()):
-        ti.loop_config(block_dim=128)
-        for i, j in ti.ndrange(self.image_width, self.image_height):
-            center = src[i, j]
-            center_luma = self.luminance(center)
-            d0 = self.edge_depth[i, j]
-            n0 = self.edge_normal[i, j]
-            a0 = self.edge_albedo[i, j]
-            acc = vec3(0.0, 0.0, 0.0)
-            wsum = 0.0
-            for ox, oy in ti.static((
-                (-1, -1), (0, -1), (1, -1),
-                (-1, 0), (1, 0),
-                (-1, 1), (0, 1), (1, 1),
-            )):
-                x = ti.math.clamp(i + ox, 0, self.image_width - 1)
-                y = ti.math.clamp(j + oy, 0, self.image_height - 1)
-                d1 = self.edge_depth[x, y]
-                n1 = self.edge_normal[x, y]
-                a1 = self.edge_albedo[x, y]
-                env_pair = (d0 > 1e10) & (d1 > 1e10)
-                same_kind = env_pair | (ti.abs(d0 - d1) < 1e10)
-                normal_w = ti.math.clamp(tm.dot(n0, n1), 0.0, 1.0)
-                normal_w = ti.select(env_pair, 1.0, normal_w * normal_w)
-                albedo_diff = a1 - a0
-                albedo_w = ti.exp(-tm.dot(albedo_diff, albedo_diff) / 0.05)
-                albedo_w = ti.select(env_pair, 1.0, albedo_w)
-                w = ti.select(same_kind, normal_w * albedo_w, 0.0)
-                acc += src[x, y] * w
-                wsum += w
-            avg = acc / ti.max(wsum, 1e-06)
-            avg_luma = self.luminance(avg)
-            delta = ti.abs(center_luma - avg_luma)
-            bright_limit = ti.max(0.02, avg_luma * 0.30 + 0.008)
-            dark_limit = ti.max(0.012, avg_luma * 0.18 + 0.004)
-            limit = ti.select(center_luma < avg_luma, dark_limit, bright_limit)
-            replace = (wsum > 1.5) & (delta > limit)
-            dst[i, j] = ti.select(replace, center * 0.05 + avg * 0.95, center)
 
     @ti.kernel
     def write_denoised_image(self, src: ti.template()):
@@ -977,6 +918,9 @@ class Camera:
             self.adaptive_m2[i, j] = vec3(0.0, 0.0, 0.0)
             self.adaptive_count[i, j] = 0
             self.adaptive_active[i, j] = 1
+            self.adaptive_stable[i, j] = 0
+            pixel = i * self.image_height + j
+            self.adaptive_pixel_indices[0, pixel] = pixel
             if ti.static(self.enable_restir):
                 self.restir_curr_direct[i, j] = vec3(0.0, 0.0, 0.0)
                 self.restir_reuse_direct[i, j] = vec3(0.0, 0.0, 0.0)
@@ -991,6 +935,53 @@ class Camera:
             self.adaptive_tile_indices[tile] = tile
             self.adaptive_tile_next_indices[tile] = tile
         self.adaptive_next_tile_count[None] = self.adaptive_tile_count
+
+    @ti.func
+    def trace_adaptive_pixel(self, i, j, batch_size, min_spp, max_spp, threshold):
+        if ti.static(self.enable_restir):
+            self.restir_curr_direct[i, j] = vec3(0.0)
+        count = self.adaptive_count[i, j]
+        mean = self.adaptive_mean[i, j]
+        m2 = self.adaptive_m2[i, j]
+        for s in range(ti.min(batch_size, max_spp - count)):
+            index = count
+            r = self.get_ray(i, j, index)
+            value = self.trace_path(r, i, j, index)
+            count += 1
+            delta = value - mean
+            mean += delta / ti.cast(count, ti.f32)
+            m2 += delta * (value - mean)
+        keep_sampling = count < max_spp
+        if count >= min_spp:
+            variance = tm.max(m2 / ti.max(ti.cast(count - 1, ti.f32), 1.0), vec3(0.0))
+            stderr_rgb = ti.sqrt(tm.max(variance.x, ti.max(variance.y, variance.z)) / ti.cast(count, ti.f32))
+            stderr_luma = ti.sqrt(self.luminance(variance) / ti.cast(count, ti.f32))
+            mean_rgb = ti.max(ti.max(mean.x, ti.max(mean.y, mean.z)), 0.05)
+            mean_luma = ti.max(self.luminance(mean), 0.05)
+            err = ti.max(stderr_rgb / mean_rgb, stderr_luma / mean_luma)
+            stable = ti.select(err <= threshold, self.adaptive_stable[i, j] + 1, 0)
+            self.adaptive_stable[i, j] = stable
+            keep_sampling = keep_sampling & (stable < 2)
+        self.adaptive_count[i, j] = count
+        self.adaptive_mean[i, j] = mean
+        self.adaptive_m2[i, j] = m2
+        self.adaptive_active[i, j] = ti.cast(keep_sampling, ti.i32)
+        return keep_sampling
+
+    @ti.kernel
+    def trace_adaptive_pixel_batch(
+        self, read_queue: ti.i32, active_count: ti.i32,
+        batch_size: ti.i32, min_spp: ti.i32, max_spp: ti.i32, threshold: ti.f32,
+    ):
+        self.adaptive_active_pixels[None] = 0
+        ti.loop_config(block_dim=128)
+        for slot in range(active_count):
+            pixel = self.adaptive_pixel_indices[read_queue, slot]
+            i = pixel // self.image_height
+            j = pixel % self.image_height
+            if self.trace_adaptive_pixel(i, j, batch_size, min_spp, max_spp, threshold):
+                next_slot = ti.atomic_add(self.adaptive_active_pixels[None], 1)
+                self.adaptive_pixel_indices[1 - read_queue, next_slot] = pixel
 
     @ti.kernel
     def trace_adaptive_tile_batch(
@@ -1021,49 +1012,7 @@ class Camera:
             if (i < self.image_width) & (j < self.image_height):
                 active = self.adaptive_active[i, j]
                 if active != 0:
-                    if ti.static(self.enable_restir):
-                        self.restir_curr_direct[i, j] = vec3(0.0, 0.0, 0.0)
-                    if ti.static(self.enable_edge_buffers):
-                        self.edge_depth[i, j] = 1e20
-                        self.edge_normal[i, j] = vec3(0.0, 0.0, 0.0)
-                    if ti.static(self.enable_denoise):
-                        self.edge_albedo[i, j] = vec3(0.0, 0.0, 0.0)
-                    count = self.adaptive_count[i, j]
-                    mean = self.adaptive_mean[i, j]
-                    m2 = self.adaptive_m2[i, j]
-                    for s in range(batch_size):
-                        if count < max_spp:
-                            r = self.get_ray(i, j, count)
-                            sample = self.trace_path(r, i, j, count)
-                            count += 1
-                            inv_count = 1.0 / ti.cast(count, ti.f32)
-                            delta = sample - mean
-                            mean += delta * inv_count
-                            delta2 = sample - mean
-                            m2 += delta * delta2
-                    keep_sampling = count < max_spp
-                    if count >= min_spp:
-                        denom = ti.max(ti.cast(count - 1, ti.f32), 1.0)
-                        variance = tm.max(m2 / denom, vec3(0.0))
-                        stderr_luma = ti.sqrt(
-                            self.luminance(variance)
-                            / ti.max(ti.cast(count, ti.f32), 1.0)
-                        )
-                        stderr_rgb = ti.sqrt(
-                            tm.max(variance.x, ti.max(variance.y, variance.z))
-                            / ti.max(ti.cast(count, ti.f32), 1.0)
-                        )
-                        mean_luma = ti.max(self.luminance(mean), 0.05)
-                        mean_rgb = ti.max(
-                            ti.max(mean.x, ti.max(mean.y, mean.z)), 0.05
-                        )
-                        err = ti.max(stderr_luma / mean_luma, stderr_rgb / mean_rgb)
-                        keep_sampling = err > threshold
-                        keep_sampling = keep_sampling & (count < max_spp)
-                    self.adaptive_count[i, j] = count
-                    self.adaptive_mean[i, j] = mean
-                    self.adaptive_m2[i, j] = m2
-                    self.adaptive_active[i, j] = ti.select(keep_sampling, 1, 0)
+                    self.trace_adaptive_pixel(i, j, batch_size, min_spp, max_spp, threshold)
                 if self.adaptive_active[i, j] != 0:
                     ti.atomic_add(self.adaptive_active_pixels[None], 1)
                     if ti.atomic_max(self.adaptive_tile_next_active[tile], 1) == 0:
@@ -1082,7 +1031,37 @@ class Camera:
             mapped = tonemap_filmic(self.adaptive_mean[i, j], self.exposure[None])
             self.img[i, self.image_height - 1 - j] = float_to_rgb8(mapped)
 
+    def finish_image(self, adaptive=False):
+        ti.sync()
+        t0 = pf()
+        if self.enable_denoise and int(self.denoise_enabled[None]) != 0:
+            print("  cleaning final image...", flush=True)
+            self.prepare_surface_guides()
+            if adaptive:
+                self.prepare_adaptive_denoise_input()
+            else:
+                self.prepare_denoise_input()
+            src, dst = self.denoise_ping, self.denoise_pong
+            iterations = max(1, min(6, int(self.denoise_iterations[None])))
+            for pass_id in range(iterations):
+                self.atrous_pass(src, dst, 1 << pass_id)
+                src, dst = dst, src
+            self.denoised_result = src
+            self.write_denoised_image(src)
+        elif adaptive:
+            self.write_adaptive_image()
+        else:
+            self.write_image()
+        ti.sync()
+        self.timings["filter_and_display_seconds"] = pf() - t0
+
+    def linear_image(self):
+        if self.enable_adaptive:
+            return self.adaptive_mean.to_numpy()
+        return self.color_accum.to_numpy() * self.pixel_sample_scale
+
     def render(self):
+        trace_t0 = pf()
         t0 = pf()
         self._debug_taichi_launch("clear_accum")
         self.clear_accum()
@@ -1105,116 +1084,63 @@ class Camera:
                 self.restir_spatiotemporal_pass()
                 self._debug_taichi_return("restir_spatiotemporal_pass")
             if not self.debug_mode:
+                ti.sync()
                 print(
                     f"  completed {done}/{int(self.samples_per_pixel)} spp", flush=True
                 )
-        t0 = pf()
-        if self.enable_denoise and int(self.denoise_enabled[None]) != 0:
-            if not self.debug_mode:
-                print("  cleaning final image...", flush=True)
-            self._debug_taichi_launch("denoise")
-            self.prepare_denoise_input()
-            self.clamp_fireflies(self.denoise_ping, self.denoise_pong)
-            iterations = max(1, min(6, int(self.denoise_iterations[None])))
-            step_size = 1
-            for pass_id in range(iterations):
-                if pass_id % 2 == 0:
-                    self.atrous_pass(self.denoise_pong, self.denoise_ping, step_size)
-                else:
-                    self.atrous_pass(self.denoise_ping, self.denoise_pong, step_size)
-                step_size *= 2
-            if iterations % 2 == 0:
-                self.despeckle_pass(self.denoise_pong, self.denoise_ping)
-                self.despeckle_pass(self.denoise_ping, self.denoise_pong)
-                self.write_denoised_image(self.denoise_pong)
-            else:
-                self.despeckle_pass(self.denoise_ping, self.denoise_pong)
-                self.despeckle_pass(self.denoise_pong, self.denoise_ping)
-                self.write_denoised_image(self.denoise_ping)
-            self._debug_taichi_return("denoise+write_image", t0)
-        else:
-            if not self.debug_mode:
-                print("  preparing final image...", flush=True)
-            self._debug_taichi_launch("write_image")
-            self.write_image()
-            self._debug_taichi_return("write_image", t0)
+        ti.sync()
+        self.timings["trace_seconds"] = pf() - trace_t0
+        self.finish_image()
 
     def render_adaptive(self, min_spp: int, max_spp: int, threshold: float):
+        trace_t0 = pf()
         t0 = pf()
         self._debug_taichi_launch("clear_adaptive")
         self.clear_adaptive()
         self._debug_taichi_return("clear_adaptive", t0)
         base_batch = max(1, int(self.offline_batch_size))
         pass_id = 0
-        total_tiles = max(1, int(self.adaptive_tile_count))
+        use_pixels = self.adaptive_scheduler == "pixels"
+        read_queue = 0
         active_tiles = int(self.adaptive_active_tiles[None])
         active_pixels = int(self.adaptive_active_pixels[None])
         total_pixels = max(1, self.image_width * self.image_height)
-        while active_tiles > 0:
-            active_ratio = active_tiles / total_tiles
+        while active_pixels > 0:
             active_pixel_ratio = active_pixels / total_pixels
             batch = base_batch
-            if active_pixel_ratio < 0.65 or active_ratio < 0.5:
+            if active_pixel_ratio < 0.15:
                 batch = min(max_spp, base_batch * 2)
-            if active_pixel_ratio < 0.35 or active_ratio < 0.2:
-                batch = min(max_spp, base_batch * 4)
-            if active_pixel_ratio < 0.15 or active_ratio < 0.08:
-                batch = min(max_spp, base_batch * 8)
             t0 = pf()
-            self._debug_taichi_launch("trace_adaptive_tile_batch")
-            self.trace_adaptive_tile_batch(
-                int(active_tiles), int(batch), int(min_spp), int(max_spp), float(threshold)
-            )
-            self._debug_taichi_return("trace_adaptive_tile_batch", t0)
+            if use_pixels:
+                self.trace_adaptive_pixel_batch(
+                    read_queue, active_pixels, batch, min_spp, max_spp, threshold
+                )
+                read_queue = 1 - read_queue
+            else:
+                self.trace_adaptive_tile_batch(
+                    active_tiles, batch, min_spp, max_spp, threshold
+                )
+            self._debug_taichi_return("adaptive sampling", t0)
             if self.enable_restir and int(self.use_restir[None]) != 0:
                 self._debug_taichi_launch("restir_spatiotemporal_pass")
                 self.restir_spatiotemporal_pass()
                 self._debug_taichi_return("restir_spatiotemporal_pass")
             pass_id += 1
+            active_pixels = int(self.adaptive_active_pixels[None])
+            if not use_pixels:
+                active_tiles = int(self.adaptive_active_tiles[None])
             if not self.debug_mode and (pass_id == 1 or pass_id % 4 == 0):
-                active = int(self.adaptive_active_pixels[None])
-                total = self.image_width * self.image_height
-                done_pct = 100.0 * (1.0 - active / max(total, 1))
-                tiles_left = int(self.adaptive_active_tiles[None])
-                if tiles_left > 0:
+                done_pct = 100.0 * (1.0 - active_pixels / total_pixels)
+                if active_pixels > 0:
                     print(
-                        f"  image settled {done_pct:.1f}% ({tiles_left} active tiles)",
+                        f"  sampling finished for {done_pct:.1f}% ({active_pixels:,} pixels remaining)",
                         flush=True,
                     )
-            active_tiles = int(self.adaptive_active_tiles[None])
-            active_pixels = int(self.adaptive_active_pixels[None])
         if not self.debug_mode:
-            print("  image settled 100.0% (0 active tiles)", flush=True)
-        t0 = pf()
-        if self.enable_denoise and int(self.denoise_enabled[None]) != 0:
-            if not self.debug_mode:
-                print("  cleaning final image...", flush=True)
-            self._debug_taichi_launch("denoise")
-            self.prepare_adaptive_denoise_input()
-            self.clamp_fireflies(self.denoise_ping, self.denoise_pong)
-            iterations = max(1, min(6, int(self.denoise_iterations[None])))
-            step_size = 1
-            for pass_id in range(iterations):
-                if pass_id % 2 == 0:
-                    self.atrous_pass(self.denoise_pong, self.denoise_ping, step_size)
-                else:
-                    self.atrous_pass(self.denoise_ping, self.denoise_pong, step_size)
-                step_size *= 2
-            if iterations % 2 == 0:
-                self.despeckle_pass(self.denoise_pong, self.denoise_ping)
-                self.despeckle_pass(self.denoise_ping, self.denoise_pong)
-                self.write_denoised_image(self.denoise_pong)
-            else:
-                self.despeckle_pass(self.denoise_ping, self.denoise_pong)
-                self.despeckle_pass(self.denoise_pong, self.denoise_ping)
-                self.write_denoised_image(self.denoise_ping)
-            self._debug_taichi_return("denoise+write_image", t0)
-        else:
-            if not self.debug_mode:
-                print("  preparing final image...", flush=True)
-            self._debug_taichi_launch("write_adaptive_image")
-            self.write_adaptive_image()
-            self._debug_taichi_return("write_adaptive_image", t0)
+            print("  sampling finished (noise target or sample limit reached)", flush=True)
+        ti.sync()
+        self.timings["trace_seconds"] = pf() - trace_t0
+        self.finish_image(adaptive=True)
 
     @ti.kernel
     def progressive_step_accum(self):
@@ -1442,6 +1368,12 @@ def main():
         "--seed", type=int, default=0, help="Repeatable sampling seed.",
     )
     parser.add_argument(
+        "--stats", default="", help="Optional render timing and sample report in JSON.",
+    )
+    parser.add_argument(
+        "--linear-output", default="", help="Optional raw and filtered linear image archive (.npz).",
+    )
+    parser.add_argument(
         "--quality",
         choices=("quick", "normal", "final", "manual"),
         default="normal",
@@ -1451,6 +1383,10 @@ def main():
         "--no-adaptive",
         action="store_true",
         help="Use the same sample count for every pixel.",
+    )
+    parser.add_argument(
+        "--adaptive-scheduler", choices=("pixels", "tiles"), default="pixels",
+        help="Schedule unfinished pixels individually or in tiles.",
     )
     parser.add_argument(
         "--no-nee",
@@ -1581,6 +1517,7 @@ def main():
 
 
 def _render_one_scene(args):
+    total_t0 = pf()
     global materials
     debug_tools.log(
         f"render request: scene={args.scene}, width={args.width}, spp={args.spp}, bvh_split={args.bvh_split}, live={args.live}"
@@ -1642,6 +1579,8 @@ def _render_one_scene(args):
                 enable_adaptive=False,
             )
         camera.debug_mode = bool(args.debug)
+        camera.sampler.mode[None] = int(args.sampler == "sobol")
+        camera.sampler.seed[None] = args.seed & 0xFFFFFFFF
         with debug_tools.span("configure camera lights"):
             camera.set_lights(cam.get("nee_lights", []), use_nee_host)
         scene_light_samples = int(cam.get("light_samples", 4))
@@ -1732,6 +1671,7 @@ def _render_one_scene(args):
     camera.debug_mode = bool(args.debug)
     camera.sampler.mode[None] = int(args.sampler == "sobol")
     camera.sampler.seed[None] = args.seed & 0xFFFFFFFF
+    camera.adaptive_scheduler = args.adaptive_scheduler
     with debug_tools.span("configure camera lights"):
         camera.set_lights(cam.get("nee_lights", []), use_nee_host)
     spp = int(quality["max_spp"])
@@ -1774,6 +1714,7 @@ def _render_one_scene(args):
         flush=True,
     )
     render_t0 = pf()
+    camera.timings["setup_seconds"] = render_t0 - total_t0
     debug_tools.log("renderer path: batched path tracer")
     if quality["adaptive"]:
         camera.render_adaptive(
@@ -1781,6 +1722,7 @@ def _render_one_scene(args):
         )
     else:
         camera.render()
+    ti.sync()
     render_t1 = pf()
     debug_tools.completed(f"path trace render ({render_t1 - render_t0:.3f}s)")
     if args.output:
@@ -1794,10 +1736,38 @@ def _render_one_scene(args):
     print("Copying image from GPU...", flush=True)
     debug_tools.log("copy image field to NumPy")
     pixels = camera.img.to_numpy()
+    copy_seconds = pf() - t0
     camera._debug_taichi_return("img.to_numpy", t0)
     print(f"Saving PNG to {output_path}...", flush=True)
+    save_t0 = pf()
     with debug_tools.span(f"write PNG {output_path}"):
         ti.tools.imwrite(pixels, output_path)
+    save_seconds = pf() - save_t0
+    if args.linear_output or args.stats:
+        if camera.enable_adaptive:
+            counts = camera.adaptive_count.to_numpy()
+        else:
+            counts = np.full((camera.image_width, camera.image_height), spp, dtype=np.int32)
+        if args.linear_output:
+            archive_path = os.path.abspath(args.linear_output)
+            os.makedirs(os.path.dirname(archive_path), exist_ok=True)
+            linear = camera.linear_image()
+            filtered = camera.denoised_result.to_numpy() if camera.denoised_result is not None else linear
+            np.savez_compressed(archive_path, linear=linear, filtered=filtered, sample_counts=counts)
+        if args.stats:
+            report = dict(camera.timings)
+            report.update(
+                scene=args.scene, width=camera.image_width, height=camera.image_height,
+                sampler=args.sampler, seed=args.seed, scheduler=args.adaptive_scheduler,
+                mean_spp=float(counts.mean()), max_spp=int(counts.max()),
+                capped_pixels=int(np.count_nonzero(counts >= spp)),
+                render_seconds=render_t1 - render_t0, copy_seconds=copy_seconds,
+                save_seconds=save_seconds, total_seconds=pf() - total_t0,
+            )
+            report_path = os.path.abspath(args.stats)
+            os.makedirs(os.path.dirname(report_path), exist_ok=True)
+            with open(report_path, "w", encoding="utf-8") as report_file:
+                json.dump(report, report_file, indent=2)
     debug_tools.completed(f"saved {output_path}")
     print(f"Image saved to {output_path}", flush=True)
     print(f"Render took {render_t1 - render_t0:.3f}s", flush=True)

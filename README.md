@@ -72,6 +72,49 @@ python main.py --render-all-testscenes --width 1024 --spp 256
 python main.py --scene studio --live --width 1280 --live-spp 8
 ```
 
+### Sampling and render reports
+
+```bash
+python main.py --scene cornell_model --width 720 --spp 1024 --quality normal --seed 0 --output output/dragon.png --stats output/dragon.json
+```
+
+Explicit `--spp` values are respected in every quality mode. In `normal` and
+`quick`, this is the maximum per pixel: adaptive sampling can finish quiet pixels
+earlier. `final` and `manual` use the requested count for every pixel. If `--spp`
+is omitted, the scene and quality preset choose the budget.
+
+Scrambled Sobol sampling is the default. `--sampler random` selects a reproducible
+random baseline, and `--seed` changes the sample sequence. The Sobol direction
+numbers use the first 32 dimensions of the Joe-Kuo data, with no SciPy dependency.
+
+Adaptive rendering uses a compact queue of unfinished pixels. The previous tile
+scheduler remains available through `--adaptive-scheduler tiles` for comparison.
+Two consecutive noise checks must pass before a pixel finishes early. Reaching
+the sample limit does not mean that the noise target was met.
+
+The built-in filter uses stable surface guides and measured sample variance.
+`normal` and `quick` enable it; use `--denoise` with `final` or `manual`. Filtering
+is an approximation, so keep an unfiltered reference when evaluating fine detail.
+
+`--stats` writes setup, tracing, filtering, copy and PNG-save timings with actual
+sample counts. Setup and tracing can include Taichi kernel compilation or cache
+loading. The renderer report excludes Python startup; the comparison tool measures
+the full process separately. `--linear-output output/dragon.npz` optionally saves
+raw radiance, filtered radiance and per-pixel sample counts.
+
+```bash
+python tools/compare_quality.py --scene cornell_model --width 128 --spp 128 --reference-spp 1024 --repeats 2 --display-exposure 1
+```
+
+This creates an independent high-sample reference and compares random sampling,
+Sobol sampling and both adaptive schedulers. Results, images and logs are written
+under `output/quality_comparison/`. Linear HDR and display errors are reported
+separately. Compare repeated runs and matching error levels before drawing speed
+conclusions; compilation and startup matter especially for small images.
+
+Sampling references: [PBRT](https://pbr-book.org/4ed/Sampling_and_Reconstruction/Sampling_and_Integration)
+and [Joe-Kuo direction numbers](https://web.maths.unsw.edu.au/~fkuo/sobol/).
+
 ### Batch render test scenes with `run_tests.py`
 
 ```bash
