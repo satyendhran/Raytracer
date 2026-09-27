@@ -1321,7 +1321,7 @@ class PrimBVH:
 
         else:
             cpu_bvh_t0 = debug_tools.now() if debug_tools.enabled() else 0.0
-            builder = BVHBuilder(prim_data, layout="prim", split=split)
+            builder = BVHBuilder([(prim_mins[i], prim_maxs[i], int(prim_refs[i])) for i in range(self.bvh_prim_count)], layout="prim", split=split)
             builder.build()
             if debug_tools.enabled():
                 debug_tools.log(
