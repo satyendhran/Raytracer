@@ -7,3 +7,5 @@ tests
 gradient.png
 gradient2.png
 .taichi_cache
+__pycache__/
+*.py[cod]
