@@ -87,14 +87,18 @@ Scrambled Sobol sampling is the default. `--sampler random` selects a reproducib
 random baseline, and `--seed` changes the sample sequence. The Sobol direction
 numbers use the first 32 dimensions of the Joe-Kuo data, with no SciPy dependency.
 
-Adaptive rendering uses a compact queue of unfinished pixels. The previous tile
-scheduler remains available through `--adaptive-scheduler tiles` for comparison.
+Adaptive rendering starts with tiles and switches to a compact queue when the
+unfinished pixels become sparse. `--adaptive-scheduler pixels` and
+`--adaptive-scheduler tiles` keep either scheduler throughout for comparison.
 Two consecutive noise checks must pass before a pixel finishes early. Reaching
 the sample limit does not mean that the noise target was met.
 
 The built-in filter uses stable surface guides and measured sample variance.
 `normal` and `quick` enable it; use `--denoise` with `final` or `manual`. Filtering
 is an approximation, so keep an unfiltered reference when evaluating fine detail.
+The normal preset takes one light sample at each eligible bounce, through the
+path limit, to reduce noise from late light hits. Explicit light and depth flags
+override this preset.
 
 `--stats` writes setup, tracing, filtering, copy and PNG-save timings with actual
 sample counts. Setup and tracing can include Taichi kernel compilation or cache
@@ -111,6 +115,11 @@ Sobol sampling and both adaptive schedulers. Results, images and logs are writte
 under `output/quality_comparison/`. Linear HDR and display errors are reported
 separately. Compare repeated runs and matching error levels before drawing speed
 conclusions; compilation and startup matter especially for small images.
+
+Use `--benchmark-runs 3 --stats output/timing.json` on an offline render to repeat
+it in the same session. The report separates each render, so later runs show the
+cost after kernels are prepared. The first run and full process remain part of
+the total time.
 
 Sampling references: [PBRT](https://pbr-book.org/4ed/Sampling_and_Reconstruction/Sampling_and_Integration)
 and [Joe-Kuo direction numbers](https://web.maths.unsw.edu.au/~fkuo/sobol/).

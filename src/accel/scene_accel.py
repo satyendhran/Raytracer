@@ -969,6 +969,7 @@ class PrimBVH:
             else:
                 analytic_prims.append(p)
         self.analytic_count = len(analytic_prims)
+        self.host_analytic_primitives = tuple(analytic_prims)
         for tri in mesh_triangles:
             triangle_specs.append(
                 (
@@ -1042,7 +1043,6 @@ class PrimBVH:
         if host_materials is not None:
             for mid, mat in enumerate(host_materials):
                 mat_two_sided[mid] = int(getattr(mat, "two_sided", 0))
-        prim_data = []
         scene_min = [float("inf"), float("inf"), float("inf")]
         scene_max = [float("-inf"), float("-inf"), float("-inf")]
         for i, p in enumerate(analytic_prims):
@@ -1321,7 +1321,11 @@ class PrimBVH:
 
         else:
             cpu_bvh_t0 = debug_tools.now() if debug_tools.enabled() else 0.0
-            builder = BVHBuilder([(prim_mins[i], prim_maxs[i], int(prim_refs[i])) for i in range(self.bvh_prim_count)], layout="prim", split=split)
+            prim_data = [
+                (prim_mins[i], prim_maxs[i], int(prim_refs[i]))
+                for i in range(self.bvh_prim_count)
+            ]
+            builder = BVHBuilder(prim_data, layout="prim", split=split)
             builder.build()
             if debug_tools.enabled():
                 debug_tools.log(

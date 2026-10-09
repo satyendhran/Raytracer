@@ -107,12 +107,13 @@ class Camera:
         self.enable_restir = bool(enable_restir)
         self.enable_denoise = bool(enable_denoise)
         self.enable_adaptive = bool(enable_adaptive)
-        self.adaptive_scheduler = "pixels"
+        self.adaptive_scheduler = "auto"
         self.enable_edge_buffers = self.enable_restir or self.enable_denoise
         self.sampler = PathSampler()
         self.sample_offset = ti.field(ti.i32, shape=())
         self.timings = {}
         self.denoised_result = None
+        self.last_render_adaptive = False
         self.image_width = image_width
         self.image_height = max(1, int(image_width / aspect_ratio))
         self.adaptive_tile_cols = (
@@ -312,7 +313,15 @@ class Camera:
         missing = [key for key in required if key not in L]
         if missing:
             raise ValueError(f"NEE light metadata is missing keys: {missing}")
-        self.nee_light_indices[slot] = -1
+        prim_index = int(L.get("prim_id", -1))
+        for index, prim in enumerate(getattr(self.bvh, "host_analytic_primitives", ())):
+            if int(prim.kind) == KIND_QUAD:
+                expected = np.asarray([L["Q"], L["u"], L["v"]], dtype=np.float32)
+                actual = np.asarray([prim.center0, prim.center_vel, prim.box_min], dtype=np.float32)
+                if np.array_equal(expected, actual):
+                    prim_index = index
+                    break
+        self.nee_light_indices[slot] = prim_index
         self.nee_Q[slot] = tm.vec3(float(L["Q"][0]), float(L["Q"][1]), float(L["Q"][2]))
         self.nee_u[slot] = tm.vec3(float(L["u"][0]), float(L["u"][1]), float(L["u"][2]))
         self.nee_v[slot] = tm.vec3(float(L["v"][0]), float(L["v"][1]), float(L["v"][2]))
@@ -323,9 +332,9 @@ class Camera:
         )
 
     def _upload_indexed_nee_light(self, slot: int, prim_index: int) -> None:
-        if prim_index < 0 or prim_index >= self.bvh.prim_count:
+        if prim_index < 0 or prim_index >= self.bvh.analytic_count:
             raise ValueError(f"NEE light primitive index {prim_index} is out of range.")
-        prim = self.bvh.primitives[prim_index]
+        prim = self.bvh.host_analytic_primitives[prim_index]
         if int(prim.kind) != KIND_QUAD:
             raise ValueError(f"NEE light primitive {prim_index} is not a quad.")
         mat_id = max(0, min(int(prim.mat_id), int(materials.shape[0]) - 1))
@@ -457,6 +466,8 @@ class Camera:
                                 brdf = albedo / ti.math.pi
                                 light_pdf = dist2 / ti.max(cos_l * A, 1e-06)
                                 bsdf_pdf = cos_x / ti.math.pi
+                                if depth + 1 >= ti.min(self.max_bounces[None], self.TRACE_BOUNCE_CAP):
+                                    bsdf_pdf = 0.0
                                 mis_w = self.power_heuristic(ns_f * light_pdf, bsdf_pdf)
                                 geom = cos_x * cos_l * A / ti.max(dist2, 1e-06)
                                 contrib = brdf * Le * geom * mis_w
@@ -494,7 +505,7 @@ class Camera:
 
     @ti.func
     def bsdf_light_mis_weight(
-        self, ray: Ray, prev_p: vec3, prev_n: vec3, hit_p: vec3
+        self, ray: Ray, prev_p: vec3, prev_n: vec3, hit_p: vec3, hit_prim_id: ti.i32 = -1
     ) -> ti.f32:
         weight = 1.0
         if (self.use_nee[None] != 0) & (self.nee_count[None] > 0):
@@ -522,7 +533,10 @@ class Camera:
                                 inv_det = 1.0 / det
                                 a = (wu * vv - wv * uv) * inv_det
                                 b = (uu * wv - uv * wu) * inv_det
-                                on_hit_light = tm.length(hp - hit_p) < 0.001 * ti.max(t, 1.0)
+                                registered_id = self.nee_light_indices[k]
+                                on_hit_light = tm.length(hp - hit_p) <= 0.000001 * ti.max(t, 1.0)
+                                if registered_id >= 0:
+                                    on_hit_light = registered_id == hit_prim_id
                                 if (a >= 0.0) & (a <= 1.0) & (b >= 0.0) & (b <= 1.0) & on_hit_light:
                                     area = self.nee_area[k]
                                     dist2 = tm.dot(hp - prev_p, hp - prev_p)
@@ -646,7 +660,7 @@ class Camera:
                 if mat.material_type == 3:
                     emit_w = ti.select(
                         after_diffuse != 0,
-                        self.bsdf_light_mis_weight(ray, prev_p, prev_n, hr.p),
+                        self.bsdf_light_mis_weight(ray, prev_p, prev_n, hr.p, hr.prim_id),
                         1.0,
                     )
                     rad += attenuation * mat.emitted * emit_w
@@ -936,6 +950,14 @@ class Camera:
             self.adaptive_tile_next_indices[tile] = tile
         self.adaptive_next_tile_count[None] = self.adaptive_tile_count
 
+    @ti.kernel
+    def compact_active_pixels(self):
+        self.adaptive_active_pixels[None] = 0
+        for i, j in self.adaptive_active:
+            if self.adaptive_active[i, j] != 0:
+                slot = ti.atomic_add(self.adaptive_active_pixels[None], 1)
+                self.adaptive_pixel_indices[0, slot] = i * self.image_height + j
+
     @ti.func
     def trace_adaptive_pixel(self, i, j, batch_size, min_spp, max_spp, threshold):
         if ti.static(self.enable_restir):
@@ -1033,6 +1055,8 @@ class Camera:
 
     def finish_image(self, adaptive=False):
         ti.sync()
+        self.denoised_result = None
+        self.last_render_adaptive = adaptive
         t0 = pf()
         if self.enable_denoise and int(self.denoise_enabled[None]) != 0:
             print("  cleaning final image...", flush=True)
@@ -1056,7 +1080,7 @@ class Camera:
         self.timings["filter_and_display_seconds"] = pf() - t0
 
     def linear_image(self):
-        if self.enable_adaptive:
+        if self.last_render_adaptive:
             return self.adaptive_mean.to_numpy()
         return self.color_accum.to_numpy() * self.pixel_sample_scale
 
@@ -1079,10 +1103,6 @@ class Camera:
             self._debug_taichi_return(
                 f"trace_batch {done}/{int(self.samples_per_pixel)} spp", t0
             )
-            if self.enable_restir and int(self.use_restir[None]) != 0:
-                self._debug_taichi_launch("restir_spatiotemporal_pass")
-                self.restir_spatiotemporal_pass()
-                self._debug_taichi_return("restir_spatiotemporal_pass")
             if not self.debug_mode:
                 ti.sync()
                 print(
@@ -1107,6 +1127,12 @@ class Camera:
         total_pixels = max(1, self.image_width * self.image_height)
         while active_pixels > 0:
             active_pixel_ratio = active_pixels / total_pixels
+            if self.adaptive_scheduler == "auto" and not use_pixels:
+                tile_slots = max(1, active_tiles * self.ADAPTIVE_TILE_SIZE ** 2)
+                if active_pixels / tile_slots < 0.4:
+                    self.compact_active_pixels()
+                    read_queue = 0
+                    use_pixels = True
             batch = base_batch
             if active_pixel_ratio < 0.15:
                 batch = min(max_spp, base_batch * 2)
@@ -1121,10 +1147,6 @@ class Camera:
                     active_tiles, batch, min_spp, max_spp, threshold
                 )
             self._debug_taichi_return("adaptive sampling", t0)
-            if self.enable_restir and int(self.use_restir[None]) != 0:
-                self._debug_taichi_launch("restir_spatiotemporal_pass")
-                self.restir_spatiotemporal_pass()
-                self._debug_taichi_return("restir_spatiotemporal_pass")
             pass_id += 1
             active_pixels = int(self.adaptive_active_pixels[None])
             if not use_pixels:
@@ -1261,6 +1283,13 @@ SCENE_DEFAULT_PNG = {name: f"{name}.png" for name in ALL_TEST_SCENE_NAMES}
 SCENE_DEFAULT_PNG["default"] = "checker_scene.png"
 
 
+def _scene_export_path(path, scene):
+    if not path:
+        return ""
+    stem, extension = os.path.splitext(path)
+    return f"{stem}_{scene}{extension}"
+
+
 def _quality_settings(args, scene_spp: int):
     quality = getattr(args, "quality", "normal")
     user_set_spp = args.spp is not None
@@ -1314,8 +1343,8 @@ def _quality_settings(args, scene_spp: int):
         threshold=0.016,
         denoise=True,
         batch=max(32, int(args.offline_batch_size)),
-        light_samples=2,
-        nee_max_depth=3,
+        light_samples=1,
+        nee_max_depth=12,
         denoise_iterations=4,
         denoise_phi_color=0.07,
     )
@@ -1358,7 +1387,7 @@ def main():
         "--spp",
         type=int,
         default=None,
-        help="Samples per pixel (offline). Cornell scene defaults to 256 if unset.",
+        help="Samples per pixel. When omitted, scene and quality defaults apply.",
     )
     parser.add_argument(
         "--sampler", choices=("sobol", "random"), default="sobol",
@@ -1369,6 +1398,10 @@ def main():
     )
     parser.add_argument(
         "--stats", default="", help="Optional render timing and sample report in JSON.",
+    )
+    parser.add_argument(
+        "--benchmark-runs", type=int, default=1,
+        help="Repeat an offline render in one session to measure prepared-kernel performance.",
     )
     parser.add_argument(
         "--linear-output", default="", help="Optional raw and filtered linear image archive (.npz).",
@@ -1385,8 +1418,8 @@ def main():
         help="Use the same sample count for every pixel.",
     )
     parser.add_argument(
-        "--adaptive-scheduler", choices=("pixels", "tiles"), default="pixels",
-        help="Schedule unfinished pixels individually or in tiles.",
+        "--adaptive-scheduler", choices=("auto", "pixels", "tiles"), default="auto",
+        help="Choose the work queue automatically, or use pixels or tiles throughout.",
     )
     parser.add_argument(
         "--no-nee",
@@ -1415,24 +1448,24 @@ def main():
         "--light-samples",
         type=int,
         default=0,
-        help="Area-light samples per hit for NEE. 0 keeps the scene default; renderer cap is 8.",
+        help="Area-light samples per hit. 0 uses the quality or scene default; cap is 8.",
     )
     parser.add_argument(
         "--nee-max-depth",
         type=int,
         default=-1,
-        help="Max path depth that runs NEE direct-light shadow rays. -1 keeps the scene default.",
+        help="Max path depth for direct-light samples. -1 uses the quality or scene default.",
     )
     parser.add_argument(
         "--restir",
         action="store_true",
-        help="Enable reservoir resampling and spatiotemporal reuse for direct area-light samples.",
+        help="Enable experimental local reservoir sampling for direct area lights.",
     )
     parser.add_argument(
         "--restir-temporal",
         type=float,
         default=0.75,
-        help="Temporal reuse strength for --restir, 0 disables history and 0.95 is the cap.",
+        help="Legacy option. Temporal reuse is disabled to preserve lighting energy.",
     )
     parser.add_argument(
         "--denoise",
@@ -1476,6 +1509,8 @@ def main():
     args = parser.parse_args()
     if args.width < 1 or (args.spp is not None and args.spp < 1):
         parser.error("Width and sample count must be positive.")
+    if args.benchmark_runs < 1:
+        parser.error("Benchmark runs must be positive.")
     debug_tools.set_debug(args.debug)
     debug_tools.completed("debug mode enabled")
     with debug_tools.span("Taichi GPU startup probe"):
@@ -1505,6 +1540,8 @@ def main():
             scene_args.width = batch_w
             scene_args.spp = batch_spp
             scene_args.output = os.path.join(out_dir, f"{scene_name}.png")
+            scene_args.stats = _scene_export_path(args.stats, scene_name)
+            scene_args.linear_output = _scene_export_path(args.linear_output, scene_name)
             print(
                 f"\n=== [{scene_name}] {batch_w}px, {batch_spp} spp -> {scene_args.output} ===",
                 flush=True,
@@ -1716,12 +1753,24 @@ def _render_one_scene(args):
     render_t0 = pf()
     camera.timings["setup_seconds"] = render_t0 - total_t0
     debug_tools.log("renderer path: batched path tracer")
-    if quality["adaptive"]:
-        camera.render_adaptive(
-            int(quality["min_spp"]), int(quality["max_spp"]), float(quality["threshold"])
-        )
-    else:
-        camera.render()
+    render_runs = []
+    for run_index in range(args.benchmark_runs):
+        run_t0 = pf()
+        if quality["adaptive"]:
+            camera.render_adaptive(
+                int(quality["min_spp"]), int(quality["max_spp"]), float(quality["threshold"])
+            )
+        else:
+            camera.render()
+        ti.sync()
+        run_seconds = pf() - run_t0
+        render_runs.append(dict(
+            run=run_index + 1, render_seconds=run_seconds,
+            trace_seconds=camera.timings["trace_seconds"],
+            filter_and_display_seconds=camera.timings["filter_and_display_seconds"],
+        ))
+        if args.benchmark_runs > 1:
+            print(f"  render {run_index + 1}/{args.benchmark_runs}: {run_seconds:.3f}s", flush=True)
     ti.sync()
     render_t1 = pf()
     debug_tools.completed(f"path trace render ({render_t1 - render_t0:.3f}s)")
@@ -1744,7 +1793,7 @@ def _render_one_scene(args):
         ti.tools.imwrite(pixels, output_path)
     save_seconds = pf() - save_t0
     if args.linear_output or args.stats:
-        if camera.enable_adaptive:
+        if camera.last_render_adaptive:
             counts = camera.adaptive_count.to_numpy()
         else:
             counts = np.full((camera.image_width, camera.image_height), spp, dtype=np.int32)
@@ -1763,6 +1812,7 @@ def _render_one_scene(args):
                 capped_pixels=int(np.count_nonzero(counts >= spp)),
                 render_seconds=render_t1 - render_t0, copy_seconds=copy_seconds,
                 save_seconds=save_seconds, total_seconds=pf() - total_t0,
+                render_runs=render_runs,
             )
             report_path = os.path.abspath(args.stats)
             os.makedirs(os.path.dirname(report_path), exist_ok=True)
